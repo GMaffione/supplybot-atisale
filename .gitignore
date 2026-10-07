@@ -1,0 +1,21 @@
+# Segreti: il file .env NON va mai nel repository (si consegna a parte)
+.env
+
+# Dipendenze e ambienti
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# File generati a runtime
+backend/chroma_db/
+data_agent/charts/
+frontend/dist/
+
+# Sistema / editor
+.DS_Store
+Thumbs.db
+.vscode/
+*.log

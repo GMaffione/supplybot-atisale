@@ -1,2 +1,253 @@
-# supplybot-atisale
-Progetto finale master
+# SupplyBot – agente AI ibrido per la Supply Chain di Atisale
+
+SupplyBot è un assistente conversazionale per il reparto Supply Chain di un produttore di sale marino. Da un'unica chat risponde a due tipi di domande e **decide da solo** quale strada prendere:
+
+- **regole e procedure** (priorità degli ordini, soglie di puntualità, gestione dei reclami) → cerca nel *Manuale Operativo Supply Chain* con una **RAG su ChromaDB**;
+- **numeri e andamenti** (volumi stagionali, puntualità dei vettori, ritardi) → delega a un **data agent Python** che pulisce il dataset, scrive ed esegue codice pandas e genera grafici;
+- **domande ibride** (es. "quali vettori sono sotto l'obiettivo del manuale?") → prima legge la regola nel manuale, poi la passa al data agent per verificarla sui dati.
+
+> **Avviso.** Progetto didattico. Il caso è ispirato ad **Atisale S.p.A.** solo per i fatti pubblici (le saline di Margherita di Savoia e Sant'Antioco, le linee di prodotto). Manuale, dataset, clienti, vettori, volumi e soglie sono **simulati** e non descrivono l'organizzazione reale dell'azienda.
+
+---
+
+## Architettura
+
+```mermaid
+flowchart LR
+    U([Utente]) --> FE["Front end React<br/>chat con memoria"]
+    FE -- "POST /api/chat" --> BE["Back end Node.js<br/>orchestratore"]
+    BE -- "function calling" --> LLM{{"LLM OpenAI<br/>decide la strada"}}
+    LLM -- "cerca_manuale" --> RAG[("ChromaDB locale<br/>manuale in frammenti")]
+    LLM -- "analizza_dati" --> DA["Data agent Python<br/>FastAPI + pandas agent"]
+    DA --> CSV[("spedizioni_clienti.csv")]
+    DA -- "grafico PNG" --> BE
+    BE -- "risposta + grafici + traccia" --> FE
+```
+
+| Servizio | Cartella | Tecnologia | Porta |
+| --- | --- | --- | --- |
+| Interfaccia | `frontend/` | React 19 + Vite | 5173 |
+| Orchestratore | `backend/` | Node.js 20+, Express, SDK OpenAI, client ChromaDB | 3001 |
+| Database vettoriale | `backend/chroma_db/` (creato all'avvio) | ChromaDB in locale | 8001 |
+| Analisi dati | `data_agent/` | Python, FastAPI, pandas, matplotlib | 8000 |
+
+**Come decide.** Il back end implementa un ciclo ReAct (*Reason + Act*) con il function calling nativo dell'SDK OpenAI. A ogni domanda l'LLM riceve due strumenti, `cerca_manuale` e `analizza_dati`, e sceglie quale chiamare (anche entrambi, in sequenza). Ne osserva il risultato e decide se ha abbastanza informazioni per rispondere. Ogni risposta arriva al front end con la **traccia delle decisioni**: quali strumenti, con quali input, quali capitoli del manuale, quale codice è stato eseguito. Il flusso è quindi verificabile.
+
+### Architettura degli agenti: orchestratore e specialista
+
+SupplyBot è un sistema **gerarchico a due agenti**. Per agente si intende un LLM che ragiona in un ciclo (decide, usa uno strumento, osserva il risultato, decide di nuovo); uno strumento invece esegue senza decidere.
+
+| Componente | Ruolo | Agente? |
+| --- | --- | --- |
+| Orchestratore (`backend/`) | Parla con l'utente, tiene la memoria della conversazione, sceglie la strada | **Sì**: LLM con ciclo ReAct e due strumenti |
+| Data agent (`data_agent/`) | Pulisce i dati, scrive ed esegue codice pandas, genera grafici | **Sì**: un secondo LLM con il proprio ciclo ReAct e i propri strumenti (`pulisci_dataset`, `esegui_python`) |
+| RAG su ChromaDB | Restituisce i paragrafi del manuale più pertinenti | **No**: strumento di recupero, senza LLM |
+
+Il modello è quello **orchestratore–specialista** (*agent as a tool*): l'orchestratore usa il data agent come uno dei suoi strumenti, gli affida un compito completo e ne riceve il risultato. La comunicazione è a senso unico: il data agent non vede la conversazione e non parla con l'utente, per cui l'orchestratore riformula le domande di seguito in domande autonome.
+
+Perché due agenti e non uno:
+
+- **separazione dei contesti**: l'orchestratore ragiona su conversazione e regole, il data agent su colonne, codice ed errori di pandas;
+- **sicurezza**: il codice generato viene eseguito solo nel servizio Python isolato, mai nell'orchestratore;
+- **modelli indipendenti**: il data agent può usare un modello più adatto al codice (`OPENAI_MODEL_DATA`) senza cambiare quello dell'orchestratore;
+- **coerenza con l'architettura a microservizi** richiesta: ogni agente vive nel proprio servizio.
+
+Non è un sistema multi-agente "alla pari": è volutamente il minimo indispensabile, un orchestratore e un solo specialista, perché ogni agente in più aggiunge costi, latenza e punti di errore.
+
+---
+
+## Prerequisiti
+
+- **Windows 10/11** (le istruzioni manuali valgono anche per macOS e Linux)
+- **Python 3.10 – 3.13**
+- **Node.js 20** o superiore
+- Una **chiave API di OpenAI**
+
+## Installazione
+
+### Metodo rapido (Windows; su macOS/Linux `./installa.sh`)
+
+1. Clona il repository e apri la cartella:
+   ```bat
+   git clone https://github.com/GMaffione/supplybot-atisale.git
+   cd supplybot-atisale
+   ```
+2. Esegui **`installa.bat`**: crea l'ambiente Python `.venv`, installa le dipendenze dei tre servizi e crea il file `.env` da `.env.example`.
+3. Apri `.env` e inserisci la tua chiave in `OPENAI_API_KEY`.
+
+### Metodo manuale
+
+```bat
+REM 1. Ambiente Python (data agent + ChromaDB)
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r data_agent\requirements.txt
+
+REM 2. Back end Node
+cd backend
+npm install
+cd ..
+
+REM 3. Front end React
+cd frontend
+npm install
+cd ..
+
+REM 4. Variabili d'ambiente
+copy .env.example .env
+REM ...poi inserisci la chiave in .env
+```
+
+Su macOS/Linux: `source .venv/bin/activate` al posto di `.venv\Scripts\activate` e `cp` al posto di `copy`.
+
+## Avvio
+
+### Metodo rapido (Windows; su macOS/Linux `./avvia.sh`)
+
+Esegui **`avvia.bat`**: apre una finestra per ogni servizio, nell'ordine giusto, e poi il browser su <http://localhost:5173>. Per fermare tutto chiudi le quattro finestre.
+
+### Metodo manuale – quattro terminali, in quest'ordine
+
+| # | Servizio | Comando (dalla radice del progetto, con `.venv` attivo) |
+| --- | --- | --- |
+| 1 | ChromaDB | `chroma run --path backend/chroma_db --port 8001` |
+| 2 | Data agent | `cd data_agent` e poi `python -m uvicorn app:app --port 8000` |
+| 3 | Back end | `cd backend` e poi `npm start` |
+| 4 | Front end | `cd frontend` e poi `npm run dev` |
+
+Poi apri <http://localhost:5173>. In alto a destra due indicatori mostrano se *Manuale* (ChromaDB) e *Dati* (data agent) sono raggiungibili.
+
+Al primo avvio il back end **indicizza da solo il manuale** in ChromaDB (29 frammenti). Per reindicizzarlo da zero, ad esempio dopo averlo modificato: `cd backend` e poi `npm run ingest`.
+
+---
+
+## Domande di esempio
+
+| Strada | Domanda |
+| --- | --- |
+| Manuale (RAG) | Un comune chiede sale da disgelo per un'allerta neve: entro quanto va servito? |
+| Manuale (RAG) | Come si gestisce un reclamo per sacchi rotti? |
+| Dati + grafico | Come sono andati i volumi di sale da disgelo nell'inverno 2025-26, mese per mese? |
+| Dati + grafico | Le spedizioni via nave da Sant'Antioco sono meno puntuali d'inverno? |
+| Ibrida | Quali vettori sono sotto l'obiettivo di puntualità previsto dal manuale? |
+| Ibrida | Quanto sale da disgelo dobbiamo avere a scorta entro il 31 ottobre? |
+| Memoria | (dopo la domanda sui vettori) E per le spedizioni da Sant'Antioco? |
+
+---
+
+## Struttura del repository
+
+```
+supplybot/
+├── frontend/                 Interfaccia React (chat, indicatore di attesa, grafici, traccia)
+│   └── src/App.jsx, styles.css
+├── backend/                  Orchestratore Node.js
+│   └── src/
+│       ├── server.js         Endpoint /api/chat, /api/charts, /api/health, /api/reset
+│       ├── orchestrator.js   Prompt di sistema, strumenti, ciclo ReAct, memoria delle sessioni
+│       ├── rag.js            PDF -> frammenti -> embedding -> ChromaDB; ricerca semantica
+│       ├── ingest.js         Reindicizzazione manuale del manuale
+│       ├── dataAgent.js      Client HTTP verso il servizio Python
+│       └── config.js         Lettura del file .env
+├── data_agent/               Microservizio Python
+│   ├── app.py                FastAPI: /analyze, /charts/{nome}, /health
+│   ├── agente_dati.py        Pandas agent: ciclo ReAct con autocorrezione
+│   ├── pulizia.py            Regole di pulizia del dataset, con report delle correzioni
+│   ├── sandbox.py            Controllo ed esecuzione isolata del codice generato
+│   ├── _runner.py            Processo figlio che esegue il codice
+│   ├── prototipo_data_agent.ipynb   Notebook di prototipazione in modalità verbose
+│   └── requirements.txt
+├── data/
+│   ├── spedizioni_clienti.csv        Dataset (1.501 righe, volutamente "sporco")
+│   ├── manuale_supply_chain.pdf      Knowledge base della RAG
+│   ├── manuale_supply_chain.md       Sorgente modificabile del manuale
+│   ├── genera_dataset.py             Rigenera il CSV (seme fisso)
+│   └── genera_manuale_pdf.py         Rigenera il PDF dal Markdown
+├── tests/
+│   ├── test_e2e.py           Test end-to-end dell'architettura (strumenti scelti, pulizia, grafici, memoria)
+│   └── fake_openai.py        Finto server OpenAI per testare tutta la catena senza chiave
+├── presentazione/            Presentazione del progetto (PDF)
+├── installa.bat, avvia.bat   Installazione e avvio su Windows
+├── installa.sh, avvia.sh     Installazione e avvio su macOS/Linux
+├── .env.example              Modello delle variabili d'ambiente
+└── .gitignore                Esclude .env, node_modules, .venv, __pycache__, file generati
+```
+
+---
+
+## I dati
+
+**`spedizioni_clienti.csv`**: 1.501 spedizioni da gennaio 2025 a settembre 2026, 17 colonne (sito, linea di prodotto, canale, regione, priorità, tonnellate ordinate e consegnate, prezzo, vettore, costo del trasporto, date richiesta ed effettiva, stato, reclamo). Contiene di proposito:
+
+- 20 righe duplicate;
+- date in due formati (`2025-01-07` e `07/01/2025`);
+- prezzi scritti come testo (`85,40`, `€ 85.40`);
+- regioni e linee di prodotto scritte in modi diversi (`Emilia Romagna`, `ER`, `lombardia`…);
+- valori mancanti e impossibili (tonnellate negative, prezzi cento volte fuori scala, consegne datate prima dell'ordine).
+
+Il data agent prima li **diagnostica** (`profila_dataset`: quali anomalie e quante), poi **sceglie** le operazioni di pulizia da applicare (`pulisci_dataset`) e dichiara cosa ha corretto. Nei dati sono presenti anche andamenti realistici da scoprire: il picco invernale del sale da disgelo, i ritardi delle navi da Sant'Antioco nei mesi di maltempo, un vettore la cui puntualità peggiora nel 2026.
+
+**`manuale_supply_chain.pdf`**: 10 capitoli (siti, calendario stagionale, scorte, ordini e priorità, trasporti e OTIF, qualità, reclami, imballaggi, FAQ). Contiene le soglie che il dataset permette di verificare: obiettivo OTIF 95%, regola delle 48 ore per le urgenze neve, scorta di disgelo pari al 50% dell'inverno precedente.
+
+---
+
+## Scelte tecniche
+
+- **Orchestrazione con l'SDK nativo OpenAI**, senza framework: il ciclo ragiona-agisci-osserva è scritto per intero in `orchestrator.js`, quindi è leggibile e facile da verificare.
+- **Domande autonome per il data agent**: il data agent non vede la conversazione, quindi l'orchestratore riformula le domande di seguito (es. "E per Sant'Antioco?") in domande complete. La memoria resta nel back end, per sessione.
+- **RAG custom**: il PDF è diviso per paragrafi numerati del manuale, una FAQ per frammento. Un controllo sulla numerazione evita di scambiare un elenco puntato per un titolo. Ogni frammento conserva il numero di capitolo, così le risposte citano la fonte (es. *Manuale, cap. 5.3*).
+- **Pandas agent come interprete deterministico**: l'LLM scrive il codice pandas, ma i numeri li calcola Python. È implementato con il function calling nativo invece che con `create_pandas_dataframe_agent` di LangChain: stesso schema (l'LLM scrive codice, un interprete lo esegue, l'LLM legge il risultato), ma con pieno controllo su sandbox, tempo massimo, autocorrezione e traccia dei passi.
+- **Data cleaning deciso dall'agente**: l'agente diagnostica il CSV grezzo e sceglie quali operazioni di pulizia applicare in base alle anomalie trovate; ogni operazione è scritta in codice testato (`pulizia.py`), così il risultato è riproducibile. I valori impossibili vengono resi mancanti, mai inventati.
+- **Glossario aziendale nei prompt**: le definizioni del manuale (stagione invernale = novembre-febbraio, OTIF, volumi = tonnellate consegnate) sono scritte nei prompt, perché nelle prove con il modello reale l'LLM tendeva a usare definizioni proprie.
+- **Autocorrezione**: se il codice generato va in errore, il traceback torna all'LLM, che lo corregge e riprova.
+- **Guardia anti-allucinazione**: se il data agent prova a rispondere senza aver eseguito nessun calcolo, viene rimandato a calcolare.
+
+## Problemi incontrati e soluzioni
+
+| Problema | Soluzione |
+| --- | --- |
+| Date in due formati: con un parser unico «2025-01-07» diventava 1° luglio e il disgelo sembrava venduto d'estate | Ogni formato viene letto separatamente (`pulizia.py`) |
+| Nel PDF un elenco numerato veniva scambiato per l'inizio di nuovi capitoli | Un titolo è accettato solo se segue la numerazione attesa (`rag.js`) |
+| Con alcuni modelli recenti OpenAI rifiuta gli strumenti se il ragionamento interno è attivo (errore 400) | Riprova automatica con `reasoning_effort=none`, compatibile anche con i modelli precedenti |
+| Nelle prove reali l'LLM definiva da sé l'«inverno» (senza novembre) e alternava tonnellate ordinate e consegnate | Glossario aziendale nei prompt dell'orchestratore e del data agent |
+| Una domanda su un andamento poteva arrivare senza grafico | Il data agent crea sempre un grafico quando confronta più valori |
+
+## Sicurezza
+
+- **Nessuna chiave nel codice**: tutte le credenziali stanno nel file `.env`, escluso dal version control tramite `.gitignore`. Il file `.env.example` mostra solo i nomi delle variabili. Il back end si ferma con un messaggio chiaro se la chiave manca.
+- **Esecuzione controllata del codice generato** (`sandbox.py`):
+  - controllo statico prima dell'esecuzione: sono ammessi solo pandas, numpy, matplotlib, seaborn, math, datetime e statistics; niente file, rete, sistema operativo, `eval` o `exec`;
+  - esecuzione in un processo separato, con un tempo massimo di 40 secondi;
+  - funzioni di base ridotte al minimo.
+
+  È una protezione adeguata a un servizio locale, non una sandbox da produzione: per quello servirebbe un container isolato.
+- **Input validati**: lunghezza dei messaggi, formato dell'id di sessione, nomi dei file dei grafici. Il front end parla solo con il back end, che inoltra le immagini dal servizio Python.
+
+## Test
+
+`tests/test_e2e.py` verifica l'intera architettura a servizi avviati: per quattro domande tipo controlla gli strumenti scelti dall'orchestratore, che il data agent diagnostichi e pulisca i dati prima di calcolare, che i grafici siano scaricabili e che la memoria della sessione funzioni. Usa solo la libreria standard di Python:
+
+```bat
+python tests\test_e2e.py
+```
+
+### Test senza chiave OpenAI
+
+`tests/fake_openai.py` è un finto server compatibile con l'API OpenAI: risponde a regole, imitando le decisioni dell'LLM. Serve a verificare l'intera catena senza costi:
+
+```bat
+python tests\fake_openai.py
+REM in ogni terminale dei servizi, prima dell'avvio:
+set OPENAI_BASE_URL=http://localhost:9999/v1
+```
+
+## Problemi frequenti
+
+| Sintomo | Causa e soluzione |
+| --- | --- |
+| Il back end si chiude con "OPENAI_API_KEY mancante" | Manca il file `.env` o la chiave: copia `.env.example` in `.env` e compilalo |
+| "ChromaDB non risponde su localhost:8001" | Avvia ChromaDB prima del back end (passo 1) |
+| Indicatore *Dati* rosso | Il data agent non è avviato o è su un'altra porta: controlla il terminale del passo 2 |
+| Errore sul modello nella risposta | Il modello in `OPENAI_MODEL` non è disponibile per il tuo account: indicane un altro presente nella tua dashboard OpenAI |
+| Errore 400 "Function tools with reasoning_effort are not supported" | Gestito in automatico: il servizio riprova con `reasoning_effort=none`. Se compare comunque, aggiungi `OPENAI_REASONING_EFFORT=none` al `.env` |
+| `chroma` non riconosciuto come comando | Attiva l'ambiente `.venv` oppure usa `.venv\Scripts\chroma.exe` |
