@@ -6,6 +6,9 @@ SupplyBot è un assistente conversazionale per il reparto Supply Chain di un pro
 - **numeri e andamenti** (volumi stagionali, puntualità dei vettori, ritardi) → delega a un **data agent Python** che pulisce il dataset, scrive ed esegue codice pandas e genera grafici;
 - **domande ibride** (es. "quali vettori sono sotto l'obiettivo del manuale?") → prima legge la regola nel manuale, poi la passa al data agent per verificarla sui dati.
 
+> **Prova l'app online:** <https://supplybot-atisale.onrender.com>
+> È ospitata sul piano gratuito di Render: dopo 15 minuti senza visite il servizio si addormenta e la prima apertura può richiedere circa un minuto. Le analisi con grafico sono più lente che in locale (CPU ridotta). Per proteggere i costi ogni visitatore può fare al massimo 20 domande all'ora.
+
 > **Avviso.** Progetto didattico. Il caso è ispirato ad **Atisale S.p.A.** solo per i fatti pubblici (le saline di Margherita di Savoia e Sant'Antioco, le linee di prodotto). Manuale, dataset, clienti, vettori, volumi e soglie sono **simulati** e non descrivono l'organizzazione reale dell'azienda.
 
 ---
@@ -121,6 +124,43 @@ Al primo avvio il back end **indicizza da solo il manuale** in ChromaDB (29 fram
 
 ---
 
+## Versione online (deploy)
+
+L'app è pubblicata su **Render** (piano gratuito) con l'indice del manuale su **Chroma Cloud**. Il codice è lo stesso della versione locale: cambiano solo le variabili d'ambiente.
+
+```mermaid
+flowchart LR
+    U([Visitatore]) -- HTTPS --> BE
+    subgraph R["Render · un container (Dockerfile)"]
+        BE["Back end Node.js<br/>orchestratore + pagina React compilata<br/>porta pubblica"] -- "HTTP interno<br/>127.0.0.1:8000" --> DA["Data agent Python<br/>FastAPI"]
+    end
+    BE -- "CHROMA_API_KEY" --> CC[("Chroma Cloud<br/>manuale indicizzato")]
+    BE & DA -- "OPENAI_API_KEY" --> AI{{OpenAI}}
+```
+
+| | In locale | Online |
+|---|---|---|
+| Front end | Vite su :5173, inoltra `/api` al back end | pagina React compilata, servita dal back end: un solo indirizzo |
+| Back end e data agent | due processi sul PC | due processi nello **stesso container**, che comunicano via HTTP come in locale; il data agent non è raggiungibile dall'esterno |
+| ChromaDB | server locale (`chroma run`) | **Chroma Cloud**: si attiva da solo se è impostata `CHROMA_API_KEY` |
+| Chiavi | file `.env` | variabili d'ambiente del servizio su Render |
+
+**Perché un solo container.** Il piano gratuito di Render offre servizi da 512 MB che si addormentano dopo 15 minuti, e non permette a un servizio gratuito di riceverne un altro sulla rete privata. Con due servizi separati il data agent sarebbe stato pubblico e i "risvegli" si sarebbero sommati. Nello stesso container i due processi restano separati (stessa architettura a microservizi), consumano circa 400 MB e si svegliano insieme.
+
+**Protezione dei costi** (l'app è pubblica e usa la chiave del progetto), in `backend/src/limiti.js` e `config.js`:
+- massimo 20 domande all'ora per visitatore e 300 al giorno in totale (`LIMITE_DOMANDE_ORA`, `LIMITE_DOMANDE_GIORNO`);
+- domande di massimo 1.000 caratteri;
+- timeout sulle chiamate a OpenAI (60 s nel back end, 90 s nel data agent) e un solo nuovo tentativo;
+- al massimo 500 conversazioni in memoria;
+- consigliato anche un tetto di spesa mensile sul progetto OpenAI.
+
+### Come pubblicarla (una sola volta)
+
+1. **Chroma Cloud**: crea un database (es. `supplybot`) e una API key. Annota API key, tenant e nome del database.
+2. **Render**: *New → Blueprint*, collega questo repository. Render legge `render.yaml` e chiede le quattro chiavi: `OPENAI_API_KEY`, `CHROMA_API_KEY`, `CHROMA_TENANT`, `CHROMA_DATABASE`.
+3. Al primo avvio il back end indicizza il manuale su Chroma Cloud (29 frammenti); dagli avvii successivi lo trova già pronto.
+4. Ogni `git push` sul ramo `main` ripubblica l'app automaticamente.
+
 ## Domande di esempio
 
 | Strada | Domanda |
@@ -148,7 +188,8 @@ supplybot/
 │       ├── rag.js            PDF -> frammenti -> embedding -> ChromaDB; ricerca semantica
 │       ├── ingest.js         Reindicizzazione manuale del manuale
 │       ├── dataAgent.js      Client HTTP verso il servizio Python
-│       └── config.js         Lettura del file .env
+│       ├── limiti.js         Limiti di domande per visitatore e al giorno (versione online)
+│       └── config.js         Lettura del file .env / variabili d'ambiente
 ├── data_agent/               Microservizio Python
 │   ├── app.py                FastAPI: /analyze, /charts/{nome}, /health
 │   ├── agente_dati.py        Pandas agent: ciclo ReAct con autocorrezione
@@ -156,7 +197,8 @@ supplybot/
 │   ├── sandbox.py            Controllo ed esecuzione isolata del codice generato
 │   ├── _runner.py            Processo figlio che esegue il codice
 │   ├── prototipo_data_agent.ipynb   Notebook di prototipazione in modalità verbose
-│   └── requirements.txt
+│   ├── requirements-server.txt   Librerie del solo servizio (usate anche online)
+│   └── requirements.txt          Installazione locale completa (servizio + ChromaDB + notebook)
 ├── data/
 │   ├── spedizioni_clienti.csv        Dataset (1.501 righe, volutamente "sporco")
 │   ├── manuale_supply_chain.pdf      Knowledge base della RAG
@@ -167,6 +209,8 @@ supplybot/
 │   ├── test_e2e.py           Test end-to-end dell'architettura (strumenti scelti, pulizia, grafici, memoria)
 │   └── fake_openai.py        Finto server OpenAI per testare tutta la catena senza chiave
 ├── presentazione/            Presentazione del progetto (PDF)
+├── Dockerfile, render.yaml   Deploy online su Render (vedi "Versione online")
+├── deploy/avvia-online.sh    Avvio dei servizi dentro il container
 ├── installa.bat, avvia.bat   Installazione e avvio su Windows
 ├── installa.sh, avvia.sh     Installazione e avvio su macOS/Linux
 ├── .env.example              Modello delle variabili d'ambiente
@@ -217,10 +261,12 @@ Il data agent prima li **diagnostica** (`profila_dataset`: quali anomalie e quan
 - **Nessuna chiave nel codice**: tutte le credenziali stanno nel file `.env`, escluso dal version control tramite `.gitignore`. Il file `.env.example` mostra solo i nomi delle variabili. Il back end si ferma con un messaggio chiaro se la chiave manca.
 - **Esecuzione controllata del codice generato** (`sandbox.py`):
   - controllo statico prima dell'esecuzione: sono ammessi solo pandas, numpy, matplotlib, seaborn, math, datetime e statistics; niente file, rete, sistema operativo, `eval` o `exec`;
-  - esecuzione in un processo separato, con un tempo massimo di 40 secondi;
-  - funzioni di base ridotte al minimo.
+  - esecuzione in un processo separato, con un tempo massimo di 40 secondi (120 online, dove la CPU è ridotta);
+  - funzioni di base ridotte al minimo;
+  - il processo figlio riceve un ambiente ridotto, **senza la chiave OpenAI**: il codice generato non può leggerla nemmeno passando da un modulo ammesso.
 
-  È una protezione adeguata a un servizio locale, non una sandbox da produzione: per quello servirebbe un container isolato.
+  È una protezione adeguata a un servizio dimostrativo, non una sandbox da produzione: per quello servirebbe un container isolato per ogni esecuzione.
+- **Versione online**: le chiavi sono variabili d'ambiente di Render e non stanno né nel repository né nell'immagine (`.dockerignore` esclude ogni `.env`); il data agent ascolta solo all'interno del container; limiti di utilizzo e timeout proteggono i costi (vedi "Versione online").
 - **Input validati**: lunghezza dei messaggi, formato dell'id di sessione, nomi dei file dei grafici. Il front end parla solo con il back end, che inoltra le immagini dal servizio Python.
 
 ## Test

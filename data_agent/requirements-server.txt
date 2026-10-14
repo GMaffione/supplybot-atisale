@@ -1,0 +1,10 @@
+# Dipendenze del solo servizio data agent (usate anche dal deploy online, vedi Dockerfile)
+# Versioni minime; testato con le versioni indicate a commento. Python 3.10 - 3.13.
+fastapi>=0.110          # 0.142.2
+uvicorn>=0.29           # 0.53.0
+openai>=1.60            # 3.24.0
+python-dotenv>=1.0      # 1.2.3
+pandas>=2.2             # 3.0.5
+numpy>=1.26             # 2.5.3
+matplotlib>=3.8         # 3.11.2
+seaborn>=0.13           # 0.13.2

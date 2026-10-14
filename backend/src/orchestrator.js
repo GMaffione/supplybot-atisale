@@ -6,7 +6,7 @@ import { config } from "./config.js";
 import { cercaManuale } from "./rag.js";
 import { analizzaDati } from "./dataAgent.js";
 
-const openai = new OpenAI();
+const openai = new OpenAI({ timeout: config.timeoutOpenAiMs, maxRetries: 1 });
 
 const PROMPT_DI_SISTEMA = `Sei SupplyBot, l'assistente del reparto Supply Chain di Atisale (sale marino, saline di
 Margherita di Savoia e Sant'Antioco). Aiuti l'ufficio ordini, la logistica e il Supply Chain Manager.
@@ -148,7 +148,10 @@ export async function chat(idSessione, messaggioUtente) {
       const testo = msg.content ?? "";
       // in memoria solo domanda e risposta finale: la conversazione resta leggera
       const nuovaStoria = [...storia, { role: "user", content: messaggioUtente }, { role: "assistant", content: testo }];
+      sessioni.delete(idSessione); // reinserita in fondo: la Map resta ordinata dalla meno recente
       sessioni.set(idSessione, nuovaStoria.slice(-2 * config.maxTurniMemoria));
+      // app pubblica: si tengono al massimo 500 conversazioni, le piu' vecchie si scartano
+      while (sessioni.size > 500) sessioni.delete(sessioni.keys().next().value);
       return { risposta: testo, grafici, traccia };
     }
 

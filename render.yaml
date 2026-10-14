@@ -1,0 +1,27 @@
+# Blueprint di Render: descrive il servizio online di SupplyBot.
+# Su Render: New > Blueprint > scegli questo repository. Le variabili con "sync: false"
+# (le chiavi) vengono chieste una sola volta durante la creazione e non stanno nel repository.
+services:
+  - type: web
+    name: supplybot-atisale
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/ping
+    autoDeploy: true
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: CHROMA_API_KEY
+        sync: false
+      - key: CHROMA_TENANT
+        sync: false
+      - key: CHROMA_DATABASE
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-6-luna
+      - key: LIMITE_DOMANDE_ORA
+        value: "20"
+      - key: LIMITE_DOMANDE_GIORNO
+        value: "300"

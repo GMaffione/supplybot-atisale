@@ -1,12 +1,21 @@
-// RAG custom su ChromaDB locale: indicizzazione del manuale e ricerca semantica.
+// RAG custom su ChromaDB: indicizzazione del manuale e ricerca semantica.
+// In locale si usa il server ChromaDB avviato sul PC; online (CHROMA_API_KEY impostata) Chroma Cloud.
+// Il codice di indicizzazione e ricerca e' lo stesso: cambia solo il client.
 import fs from "node:fs";
-import { ChromaClient } from "chromadb";
+import { ChromaClient, CloudClient } from "chromadb";
 import OpenAI from "openai";
 import { PDFParse } from "pdf-parse";
 import { config } from "./config.js";
 
-const openai = new OpenAI(); // legge OPENAI_API_KEY (ed eventuale OPENAI_BASE_URL) dall'ambiente
-const chroma = new ChromaClient({ host: config.chromaHost, port: config.chromaPorta });
+// legge OPENAI_API_KEY (ed eventuale OPENAI_BASE_URL) dall'ambiente
+const openai = new OpenAI({ timeout: config.timeoutOpenAiMs, maxRetries: 1 });
+const chroma = config.chromaCloud
+  ? new CloudClient(config.chromaCloud)
+  : new ChromaClient({ host: config.chromaHost, port: config.chromaPorta });
+// Chroma Cloud usa l'indice SPANN, il server locale HNSW: in entrambi i casi distanza coseno
+const CONFIG_INDICE = config.chromaCloud ? { spann: { space: "cosine" } } : { hnsw: { space: "cosine" } };
+
+export const descrizioneChroma = config.chromaCloud ? "Chroma Cloud" : `${config.chromaHost}:${config.chromaPorta}`;
 
 async function embedding(testi) {
   const r = await openai.embeddings.create({ model: config.modelloEmbedding, input: testi });
@@ -84,7 +93,7 @@ export async function indicizzaManuale({ forza = false } = {}) {
   const collezione = await chroma.getOrCreateCollection({
     name: config.collezione,
     embeddingFunction: null, // gli embedding li calcoliamo noi con OpenAI
-    configuration: { hnsw: { space: "cosine" } },
+    configuration: CONFIG_INDICE,
   });
   const presenti = await collezione.count();
   if (presenti > 0 && !forza) return { frammenti: presenti, nuovi: 0 };

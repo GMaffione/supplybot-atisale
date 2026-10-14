@@ -12,7 +12,9 @@ deterministico ma con tre protezioni:
 3. Builtins ridotti: il codice vede solo funzioni innocue (len, sum, print...).
 
 Non e' una sandbox di sicurezza da produzione (per quello servirebbe un
-container isolato), ma e' adeguata a un servizio locale e lo dichiariamo.
+container isolato per ogni esecuzione), ma e' adeguata a un servizio dimostrativo e lo dichiariamo.
+Nella versione online il processo figlio riceve un ambiente ridotto: la chiave OpenAI non gli
+viene passata, quindi il codice dell'LLM non puo' leggerla.
 """
 
 import ast
@@ -22,7 +24,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-TIMEOUT_SECONDI = 40
+# online (piano gratuito, CPU ridotta) il tempo massimo si alza con SANDBOX_TIMEOUT
+TIMEOUT_SECONDI = int(os.getenv("SANDBOX_TIMEOUT", "40"))
 MAX_OUTPUT = 6000
 
 MODULI_AMMESSI = {"pandas", "numpy", "matplotlib", "seaborn", "math", "datetime", "statistics"}
@@ -31,8 +34,19 @@ NOMI_VIETATI = {
     "getattr", "setattr", "delattr", "breakpoint", "exit", "quit", "help", "memoryview",
     "os", "sys", "subprocess", "shutil", "socket", "pathlib", "importlib", "builtins",
 }
-METODI_VIETATI = {"to_csv", "to_excel", "to_pickle", "to_parquet", "to_sql", "to_json", "read_csv",
-                  "read_excel", "read_pickle", "read_sql", "system", "popen", "remove", "unlink"}
+METODI_VIETATI = {
+    # scrittura di file
+    "to_csv", "to_excel", "to_pickle", "to_parquet", "to_sql", "to_json", "to_html", "to_xml", "to_feather",
+    "to_hdf", "to_stata", "tofile", "savetxt", "save", "savez", "savefig",
+    # lettura di file
+    "read_csv", "read_excel", "read_pickle", "read_sql", "read_table", "read_fwf", "read_json", "read_html",
+    "read_xml", "read_parquet", "read_feather", "read_hdf", "read_sas", "read_spss", "read_stata", "read_orc",
+    "read_clipboard", "loadtxt", "genfromtxt", "fromfile", "load", "memmap",
+    # sistema
+    "system", "popen", "remove", "unlink",
+}
+# variabili d'ambiente che il processo figlio puo' vedere (niente chiavi)
+AMBIENTE_AMMESSO = ("PATH", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "HOME", "LANG", "MPLCONFIGDIR")
 
 RUNNER = Path(__file__).resolve().parent / "_runner.py"
 
@@ -62,6 +76,16 @@ def controlla_codice(codice: str) -> None:
                 raise CodiceNonAmmesso(f"Accesso non ammesso ad attributo interno: {nodo.attr}")
             if nodo.attr in METODI_VIETATI:
                 raise CodiceNonAmmesso(f"Metodo non ammesso: {nodo.attr} (niente lettura/scrittura di file)")
+            # niente scorciatoie verso il sistema passando da un modulo ammesso (es. pd.io.common.os)
+            if nodo.attr in NOMI_VIETATI or nodo.attr == "environ" or nodo.attr.startswith(("exec", "spawn", "fork", "kill")):
+                raise CodiceNonAmmesso(f"Accesso non ammesso: {nodo.attr}")
+
+
+def _ambiente_ridotto() -> dict:
+    """Solo le variabili necessarie a Python per partire: la chiave OpenAI resta fuori."""
+    ambiente = {k: v for k, v in os.environ.items() if k.upper() in AMBIENTE_AMMESSO}
+    ambiente["PYTHONIOENCODING"] = "utf-8"
+    return ambiente
 
 
 def esegui(codice: str, percorso_df: str, cartella_grafici: str) -> dict:
@@ -78,7 +102,7 @@ def esegui(codice: str, percorso_df: str, cartella_grafici: str) -> dict:
     try:
         proc = subprocess.run([sys.executable, str(RUNNER)], input=richiesta, capture_output=True,
                               text=True, timeout=TIMEOUT_SECONDI, encoding="utf-8", errors="replace",
-                              env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+                              env=_ambiente_ridotto())
     except subprocess.TimeoutExpired:
         return {"ok": False, "output": "", "errore": f"Tempo massimo superato ({TIMEOUT_SECONDI} s): "
                 "semplifica il calcolo.", "grafici": []}

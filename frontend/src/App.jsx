@@ -54,9 +54,10 @@ function StatoServizi() {
         .then(setStato)
         .catch(() => setStato({ backend: false, chroma: false, dataAgent: false }));
     controlla();
-    const t = setInterval(controlla, 30000);
+    // se un servizio non risponde (per esempio si sta ancora avviando) si ricontrolla piu' spesso
+    const t = setInterval(controlla, stato && (!stato.chroma || !stato.dataAgent) ? 10000 : 30000);
     return () => clearInterval(t);
-  }, []);
+  }, [stato?.chroma, stato?.dataAgent]);
   if (!stato) return null;
   const voci = [
     ["Manuale", stato.chroma],
@@ -219,7 +220,12 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId: sessione, message: domanda }),
       });
-      const dati = await r.json();
+      const dati = await r.json().catch(() => ({}));
+      if (r.status === 429) {
+        // limite di domande raggiunto (protezione dei costi): messaggio chiaro, nessun consiglio tecnico
+        setMessaggi((m) => [...m, { ruolo: "assistente", errore: true, testo: `**Limite raggiunto.** ${dati.error}` }]);
+        return;
+      }
       if (!r.ok) throw new Error(dati.error || `Errore ${r.status}`);
       setMessaggi((m) => [...m, { ruolo: "assistente", testo: dati.reply, grafici: dati.charts, traccia: dati.trace }]);
     } catch (e) {
@@ -308,6 +314,7 @@ export default function App() {
           id="domanda"
           ref={campo}
           rows={1}
+          maxLength={1000}
           value={bozza}
           placeholder="Scrivi una domanda…"
           title="Invio per inviare, Maiusc+Invio per andare a capo"

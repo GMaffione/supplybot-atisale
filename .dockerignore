@@ -1,0 +1,14 @@
+# Mai nell'immagine: segreti, dipendenze installate in locale, file generati
+.env
+*.env
+.git
+**/node_modules
+.venv
+venv
+**/__pycache__
+backend/chroma_db
+data_agent/charts
+frontend/dist
+presentazione
+tests
+*.ipynb

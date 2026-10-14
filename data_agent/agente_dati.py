@@ -17,6 +17,7 @@ dall'output del codice eseguito, mai dalla "memoria" del modello.
 
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -104,7 +105,7 @@ STRUMENTI = [
 
 class DataAgent:
     def __init__(self, modello=None, verbose=False, client=None):
-        self.client = client or OpenAI()  # legge OPENAI_API_KEY (e OPENAI_BASE_URL) dall'ambiente
+        self.client = client or OpenAI(timeout=90, max_retries=1)  # legge OPENAI_API_KEY (e OPENAI_BASE_URL) dall'ambiente
         self.modello = modello or os.getenv("OPENAI_MODEL_DATA") or os.getenv("OPENAI_MODEL", "gpt-6-luna")
         self.verbose = verbose
         self._reasoning_none = os.getenv("OPENAI_REASONING_EFFORT") == "none"
@@ -133,6 +134,12 @@ class DataAgent:
 
     def analizza(self, domanda: str) -> dict:
         lavoro = Path(tempfile.mkdtemp(prefix="supplybot_"))
+        try:
+            return self._analizza(domanda, lavoro)
+        finally:
+            shutil.rmtree(lavoro, ignore_errors=True)  # la copia temporanea del dataset non serve piu'
+
+    def _analizza(self, domanda: str, lavoro: Path) -> dict:
         percorso_df = None
         messaggi = [{"role": "system", "content": PROMPT_DI_SISTEMA}, {"role": "user", "content": domanda}]
         passi, grafici, report = [], [], None
