@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 [ -d .venv ] || { echo "ERRORE: esegui prima ./installa.sh"; exit 1; }
 trap 'kill 0' EXIT
 .venv/bin/chroma run --path backend/chroma_db --port 8001 > /dev/null 2>&1 &
-(cd data_agent && ../.venv/bin/python -m uvicorn app:app --port 8000) &
+(cd data_agent && ../.venv/bin/python -m uvicorn app:app --port 8000 --no-access-log) &
 (cd backend && npm start) &
 (cd frontend && npm run dev) &
 sleep 12

@@ -5,6 +5,8 @@ import OpenAI from "openai";
 import { config } from "./config.js";
 import { cercaManuale } from "./rag.js";
 import { analizzaDati } from "./dataAgent.js";
+import { CacheLRU, normalizza } from "./cache.js";
+import { log } from "./logger.js";
 
 const openai = new OpenAI({ timeout: config.timeoutOpenAiMs, maxRetries: 1 });
 
@@ -24,7 +26,8 @@ HAI DUE STRUMENTI E DECIDI TU QUALE USARE
 
 REGOLE
 - Non inventare regole o numeri: ogni regola viene dal manuale, ogni numero dal data agent.
-- Se il manuale non contiene la risposta, dillo chiaramente.
+- Se il manuale non contiene la risposta, dillo chiaramente. Se cerca_manuale risponde NESSUN RISULTATO PERTINENTE,
+  non citare capitoli: spiega che il manuale non tratta l'argomento.
 - Le domande per analizza_dati devono essere COMPLETE e AUTONOME: il data agent non vede la conversazione,
   quindi includi periodo, filtri e soglie anche se l'utente li ha detti nei messaggi precedenti
   (es. "E per Sant'Antioco?" dopo una domanda sui vettori -> "OTIF 2026 dei vettori che spediscono da Sant'Antioco...").
@@ -83,7 +86,7 @@ async function chiamaModello(parametri) {
     return await openai.chat.completions.create({ ...parametri, ...extra });
   } catch (errore) {
     if (!serveReasoningNone && errore.status === 400 && /reasoning_effort/i.test(errore.message)) {
-      console.warn("[MODELLO] Strumenti non ammessi con il ragionamento attivo: riprovo con reasoning_effort=none");
+      log.warn("modello_reasoning_none", { motivo: "strumenti non ammessi con il ragionamento attivo" });
       serveReasoningNone = true;
       return openai.chat.completions.create({ ...parametri, reasoning_effort: "none" });
     }
@@ -94,19 +97,43 @@ async function chiamaModello(parametri) {
 // Memoria delle conversazioni: per ogni sessione si tengono gli ultimi scambi utente/assistente.
 const sessioni = new Map();
 
+// Cache delle risposte complete alla PRIMA domanda di una conversazione (senza storia la risposta
+// dipende solo dalla domanda). Le domande successive non si mettono qui: "E per Sant'Antioco?"
+// significa cose diverse in conversazioni diverse.
+const cacheRisposte = new CacheLRU({ massimo: 200 });
+
+export function statoCacheRisposte() {
+  return cacheRisposte.stato();
+}
+
+function ricordaScambio(idSessione, storia, messaggioUtente, risposta) {
+  const nuovaStoria = [...storia, { role: "user", content: messaggioUtente }, { role: "assistant", content: risposta }];
+  sessioni.delete(idSessione); // reinserita in fondo: la Map resta ordinata dalla meno recente
+  sessioni.set(idSessione, nuovaStoria.slice(-2 * config.maxTurniMemoria));
+  // app pubblica: si tengono al massimo 500 conversazioni, le piu' vecchie si scartano
+  while (sessioni.size > 500) sessioni.delete(sessioni.keys().next().value);
+}
+
 export function azzeraSessione(id) {
   sessioni.delete(id);
 }
 
 async function eseguiStrumento(nome, argomenti) {
   if (nome === "cerca_manuale") {
-    const risultati = await cercaManuale(argomenti.query);
+    const { pertinenti, scartati, soglia, daCache } = await cercaManuale(argomenti.query);
+    const perLLM = pertinenti.length
+      ? pertinenti.map((r) => `[Manuale, cap. ${r.sezione}] ${r.testo}`).join("\n\n---\n\n")
+      : `NESSUN RISULTATO PERTINENTE: nessun paragrafo del manuale raggiunge la somiglianza minima (${soglia}) ` +
+        "con questa ricerca. Non citare il manuale per questa domanda.";
     return {
-      perLLM: risultati.map((r) => `[Manuale, cap. ${r.sezione}] ${r.testo}`).join("\n\n---\n\n"),
+      perLLM,
       traccia: {
         strumento: "cerca_manuale",
         input: argomenti.query,
-        fonti: risultati.map((r) => ({ sezione: r.sezione, titolo: r.titolo, somiglianza: r.somiglianza })),
+        fonti: pertinenti.map((r) => ({ sezione: r.sezione, titolo: r.titolo, somiglianza: r.somiglianza })),
+        scartate: scartati.map((r) => ({ sezione: r.sezione, titolo: r.titolo, somiglianza: r.somiglianza })),
+        soglia,
+        daCache,
       },
       grafici: [],
     };
@@ -122,6 +149,8 @@ async function eseguiStrumento(nome, argomenti) {
         passi: r.passi,
         autocorrezioni: codici.filter((p) => !p.ok).length,
         modello: r.modello,
+        daCache: Boolean(r.da_cache),
+        completata: r.completata !== false, // false: il data agent non e' arrivato a un risultato
       },
       grafici: r.grafici,
     };
@@ -131,12 +160,21 @@ async function eseguiStrumento(nome, argomenti) {
 
 export async function chat(idSessione, messaggioUtente) {
   const storia = sessioni.get(idSessione) ?? [];
+  const chiaveCache = storia.length === 0 ? normalizza(messaggioUtente) : null;
+  const salvata = chiaveCache ? cacheRisposte.leggi(chiaveCache) : undefined;
+  if (salvata) {
+    log.info("risposta_da_cache", { domanda: messaggioUtente });
+    ricordaScambio(idSessione, storia, messaggioUtente, salvata.risposta);
+    return { ...salvata, daCache: true };
+  }
   const messaggi = [
     { role: "system", content: PROMPT_DI_SISTEMA },
     ...storia,
     { role: "user", content: messaggioUtente },
   ];
+  /** @type {Array<Record<string, any>>} passi mostrati nel pannello "Come ho risposto" */
   const traccia = [];
+  /** @type {string[]} */
   const grafici = [];
 
   for (let passo = 0; passo < config.maxPassi; passo++) {
@@ -147,15 +185,20 @@ export async function chat(idSessione, messaggioUtente) {
     if (!msg.tool_calls?.length) {
       const testo = msg.content ?? "";
       // in memoria solo domanda e risposta finale: la conversazione resta leggera
-      const nuovaStoria = [...storia, { role: "user", content: messaggioUtente }, { role: "assistant", content: testo }];
-      sessioni.delete(idSessione); // reinserita in fondo: la Map resta ordinata dalla meno recente
-      sessioni.set(idSessione, nuovaStoria.slice(-2 * config.maxTurniMemoria));
-      // app pubblica: si tengono al massimo 500 conversazioni, le piu' vecchie si scartano
-      while (sessioni.size > 500) sessioni.delete(sessioni.keys().next().value);
-      return { risposta: testo, grafici, traccia };
+      ricordaScambio(idSessione, storia, messaggioUtente, testo);
+      const esito = { risposta: testo, grafici, traccia };
+      // in cache solo risposte riuscite: un errore o un'analisi non conclusa non devono ripetersi per ore
+      if (chiaveCache && !traccia.some((t) => t.errore || t.completata === false)) cacheRisposte.scrivi(chiaveCache, esito);
+      log.info("risposta", { strumenti: traccia.map((t) => t.strumento), grafici: grafici.length, passi: passo + 1 });
+      return { ...esito, daCache: false };
     }
 
     for (const chiamata of msg.tool_calls) {
+      if (chiamata.type !== "function") {
+        // usiamo solo strumenti di tipo funzione; ogni chiamata deve comunque ricevere una risposta
+        messaggi.push({ role: "tool", tool_call_id: chiamata.id, content: "Strumento non supportato." });
+        continue;
+      }
       const nome = chiamata.function.name;
       let argomenti = {};
       try {
@@ -163,7 +206,7 @@ export async function chat(idSessione, messaggioUtente) {
       } catch {
         /* argomenti non validi: lo strumento restituira' un errore all'LLM */
       }
-      console.log(`[DECISIONE] ${nome}(${JSON.stringify(argomenti)})`);
+      log.info("decisione", { strumento: nome, argomenti });
       let contenuto;
       try {
         const esito = await eseguiStrumento(nome, argomenti);
@@ -172,16 +215,18 @@ export async function chat(idSessione, messaggioUtente) {
         grafici.push(...esito.grafici);
       } catch (errore) {
         // l'errore torna all'LLM come osservazione: puo' riprovare o spiegare il problema all'utente
-        console.error(`[ERRORE STRUMENTO] ${nome}: ${errore.message}`);
+        log.error("errore_strumento", { strumento: nome, messaggio: errore.message });
         contenuto = `ERRORE durante ${nome}: ${errore.message}`;
         traccia.push({ strumento: nome, input: argomenti.query ?? argomenti.domanda, errore: errore.message });
       }
       messaggi.push({ role: "tool", tool_call_id: chiamata.id, content: contenuto });
     }
   }
+  log.warn("passi_esauriti", { strumenti: traccia.map((t) => t.strumento) });
   return {
     risposta: "Non sono riuscito a completare la richiesta in un numero ragionevole di passaggi. Prova a riformularla.",
     grafici,
     traccia,
+    daCache: false,
   };
 }

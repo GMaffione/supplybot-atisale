@@ -33,6 +33,8 @@ export const config = {
   collezione: "manuale_supply_chain",
   dataAgentUrl: process.env.DATA_AGENT_URL || "http://localhost:8000",
   manualePdf: path.join(RADICE, "data", "manuale_supply_chain.pdf"),
+  // RAG: sotto questa somiglianza (coseno, 0-1) un frammento del manuale non e' considerato pertinente
+  sogliaSimilarita: Number(process.env.SOGLIA_SIMILARITA ?? 0.3),
   maxPassi: 6,
   maxTurniMemoria: 12,
   // Protezione dei costi quando l'app e' pubblica: limiti per visitatore e totali al giorno

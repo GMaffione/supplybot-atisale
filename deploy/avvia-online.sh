@@ -4,7 +4,7 @@
 set -e
 
 cd /app/data_agent
-/opt/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 &
+/opt/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --no-access-log &
 
 cd /app/backend
 exec node src/server.js

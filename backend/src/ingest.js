@@ -7,4 +7,4 @@ const frammenti = dividiInFrammenti(await estraiTesto(config.manualePdf));
 console.log(`Manuale diviso in ${frammenti.length} frammenti:`);
 for (const f of frammenti) console.log(`  - ${f.metadati.sezione.padEnd(4)} ${f.metadati.titolo}`);
 const esito = await indicizzaManuale({ forza: true });
-console.log(`Indicizzati ${esito.nuovi} frammenti nella collezione "${config.collezione}".`);
+console.log(`Indicizzati ${esito.nuovi} frammenti nella collezione "${esito.collezione}".`);

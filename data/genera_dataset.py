@@ -6,30 +6,42 @@ Atisale S.p.A. solo per i fatti pubblici (due saline, linee di prodotto).
 Clienti, vettori, volumi, prezzi e tempi sono inventati e non rappresentano
 dati reali dell'azienda.
 
-Il seme e' fisso: rieseguendo lo script si ottiene sempre lo stesso file.
+Riproducibilita': TUTTA la casualita' passa da un unico generatore numpy creato con un
+seme esplicito (SEED, predefinito 42, modificabile con --seed). Nessun'altra fonte casuale
+(niente random, uuid o data di sistema): stesso seme -> stesso file, byte per byte.
+Lo script stampa l'impronta SHA-256 del CSV, per verificarlo a colpo d'occhio;
+tests/test_data_agent.py lo controlla in automatico.
 
 Struttura:
   1. si generano spedizioni "pulite" con stagionalita' e schemi realistici
   2. si inseriscono di proposito anomalie (dati sporchi) per testare il
      data cleaning dell'agente
 
-Uso:  python genera_dataset.py
+Uso:  python genera_dataset.py                 (seme 42: ricrea spedizioni_clienti.csv)
+      python genera_dataset.py --seed 7 --output altro.csv
 """
 
+import argparse
+import hashlib
 from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-SEED = 42
-rng = np.random.default_rng(SEED)
+_argomenti = argparse.ArgumentParser(description="Genera il dataset simulato delle spedizioni.")
+_argomenti.add_argument("--seed", type=int, default=42, help="seme del generatore casuale (predefinito 42)")
+_argomenti.add_argument("--output", type=Path, default=Path(__file__).parent / "spedizioni_clienti.csv")
+ARGOMENTI = _argomenti.parse_args()
+
+SEED = ARGOMENTI.seed                  # seme esplicito: l'unica fonte di casualita' dello script
+rng = np.random.default_rng(SEED)      # generatore usato da TUTTE le estrazioni casuali qui sotto
 
 INIZIO = date(2025, 1, 1)
 FINE = date(2026, 9, 30)
 OGGI = date(2026, 10, 1)  # data di estrazione del dataset
 
-OUTPUT = Path(__file__).parent / "spedizioni_clienti.csv"
+OUTPUT = ARGOMENTI.output
 
 # ---------------------------------------------------------------------------
 # 1. Anagrafiche (inventate)
@@ -301,4 +313,5 @@ dup = df.loc[a_caso(df.index.to_numpy(), 20)]
 df = pd.concat([df, dup]).sort_index(kind="stable").reset_index(drop=True)
 
 df.to_csv(OUTPUT, index=False, encoding="utf-8")
-print(f"Scritto {OUTPUT.name}: {len(df)} righe, {df.shape[1]} colonne")
+impronta = hashlib.sha256(OUTPUT.read_bytes()).hexdigest()
+print(f"Scritto {OUTPUT.name}: {len(df)} righe, {df.shape[1]} colonne (seme {SEED}, SHA-256 {impronta[:16]}...)")

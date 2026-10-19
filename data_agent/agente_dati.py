@@ -2,13 +2,15 @@
 Pandas agent di SupplyBot.
 
 Riceve una domanda in linguaggio naturale sui dati delle spedizioni e segue
-un ciclo ReAct (ragiona -> agisce -> osserva) con tre strumenti:
+un ciclo ReAct (ragiona -> agisce -> osserva) con lo strumento esegui_python,
+che esegue codice pandas/matplotlib scritto dall'LLM nella sandbox (sandbox.py)
+e restituisce l'output o l'errore.
 
-  - profila_dataset: diagnostica il CSV grezzo (quali anomalie, quante);
-  - pulisci_dataset: applica le operazioni di pulizia SCELTE dall'agente in base
-    alla diagnosi (pulizia.py) e restituisce il report delle correzioni;
-  - esegui_python: esegue codice pandas/matplotlib scritto dall'LLM nella
-    sandbox (sandbox.py) e restituisce l'output o l'errore.
+L'agente parte dal dataframe GIA' PRONTO: lettura, validazione dello schema,
+diagnosi e pulizia del CSV avvengono una sola volta all'avvio (dataset.py).
+Il riepilogo della pulizia entra nel prompt, cosi' l'agente puo' citarlo nella
+"Nota sui dati", e i passi di diagnosi e pulizia compaiono in ogni risposta.
+Le domande gia' viste si servono dalla cache (cache.py).
 
 Se il codice va in errore, l'errore torna all'LLM come osservazione e l'LLM
 lo corregge (autocorrezione). I numeri della risposta finale vengono SOLO
@@ -16,33 +18,33 @@ dall'output del codice eseguito, mai dalla "memoria" del modello.
 """
 
 import json
+import logging
 import os
-import shutil
-import tempfile
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import BadRequestError, OpenAI
 
-from pulizia import OPERAZIONI, carica_grezzo, profila_dataset, pulisci_dati
+import dataset as modulo_dataset
+from cache import CacheRisposte, normalizza
 from sandbox import esegui
 
 RADICE = Path(__file__).resolve().parent.parent
 load_dotenv(RADICE / ".env")
 
 CARTELLA_GRAFICI = Path(__file__).resolve().parent / "charts"
-MAX_PASSI = 10
+MAX_PASSI = 8
+log = logging.getLogger("supplybot.agente")
 
 PROMPT_DI_SISTEMA = """Sei il Data Agent di SupplyBot, l'analista dati del reparto Supply Chain di Atisale
 (produttore di sale marino con due saline: Margherita di Savoia in Puglia e Sant'Antioco in Sardegna).
 Rispondi a domande su un dataset di spedizioni ai clienti (gennaio 2025 - settembre 2026; dati simulati).
 
 COME LAVORI
-1. Chiama per primo `profila_dataset`: ti dice quali anomalie ci sono nel CSV grezzo e quante
-   (duplicati, testi incoerenti, date in formati misti, numeri come testo, valori impossibili, valori mancanti).
-   Poi chiama `pulisci_dataset` scegliendo TU le operazioni necessarie: applica ogni operazione che corrisponde
-   a un'anomalia presente nel profilo, perche' altrimenti i risultati sarebbero falsati. Leggi il report.
-2. Poi usa `esegui_python` per calcolare cio' che serve. Nel codice hai gia' disponibili:
+1. Il dataset e' gia' stato validato, diagnosticato e pulito all'avvio del servizio (vedi QUALITA' DEI DATI
+   in fondo): non devi pulirlo di nuovo.
+2. Usa `esegui_python` per calcolare cio' che serve. Nel codice hai gia' disponibili:
    `df` (il dataframe PULITO), `pd`, `np`, `plt` e la funzione `salva_grafico(titolo)`.
    Stampa con print() i risultati che ti servono: vedi solo cio' che stampi.
 3. Se il codice va in errore, leggi l'errore, correggi e riprova. Non ripetere lo stesso codice.
@@ -76,22 +78,12 @@ REGOLE
 FORMATO DELLA RISPOSTA FINALE
 Una sintesi per chi deve decidere, 3-6 frasi: prima il risultato principale con i numeri chiave e le unita',
 poi cosa significa per il business. Se la pulizia dei dati ha inciso sul risultato, aggiungi una riga
-"Nota sui dati:" con le correzioni rilevanti. Non citare nomi di file o codice."""
+"Nota sui dati:" con le correzioni rilevanti. Non citare nomi di file o codice.
+
+QUALITA' DEI DATI (diagnosi e pulizia eseguite all'avvio)
+"""
 
 STRUMENTI = [
-    {"type": "function", "function": {
-        "name": "profila_dataset",
-        "description": "Diagnostica il CSV grezzo delle spedizioni senza modificarlo: conta duplicati, testi "
-                       "incoerenti, formati misti, valori impossibili e mancanti. Da chiamare per primo.",
-        "parameters": {"type": "object", "properties": {}, "required": []}}},
-    {"type": "function", "function": {
-        "name": "pulisci_dataset",
-        "description": "Pulisce il CSV applicando le operazioni scelte in base al profilo; la conversione di date "
-                       "e numeri e' sempre inclusa. Restituisce il report delle correzioni. Necessario prima delle analisi.",
-        "parameters": {"type": "object", "properties": {
-            "operazioni": {"type": "array", "items": {"type": "string", "enum": list(OPERAZIONI)},
-                           "description": "Operazioni da applicare: " + "; ".join(f"{k} = {v}" for k, v in OPERAZIONI.items())}},
-            "required": ["operazioni"]}}},
     {"type": "function", "function": {
         "name": "esegui_python",
         "description": "Esegue codice Python (pandas, numpy, matplotlib) sul dataframe pulito `df`. "
@@ -104,11 +96,17 @@ STRUMENTI = [
 
 
 class DataAgent:
-    def __init__(self, modello=None, verbose=False, client=None):
+    def __init__(self, modello=None, verbose=False, client=None, dataset=None, cache=None):
         self.client = client or OpenAI(timeout=90, max_retries=1)  # legge OPENAI_API_KEY (e OPENAI_BASE_URL) dall'ambiente
         self.modello = modello or os.getenv("OPENAI_MODEL_DATA") or os.getenv("OPENAI_MODEL", "gpt-6-luna")
         self.verbose = verbose
         self._reasoning_none = os.getenv("OPENAI_REASONING_EFFORT") == "none"
+        # dataset preparato una volta (lettura, validazione, diagnosi, pulizia): DatasetNonValido se il CSV non va bene
+        self.dataset = dataset or modulo_dataset.prepara()
+        self.prompt = PROMPT_DI_SISTEMA + self.dataset.riepilogo_per_agente()
+        self.cache = cache if cache is not None else CacheRisposte(
+            massimo=int(os.getenv("CACHE_MAX_RISPOSTE", "200")),
+            durata_secondi=int(os.getenv("CACHE_DURATA_SECONDI", str(6 * 3600))))
         CARTELLA_GRAFICI.mkdir(exist_ok=True)
 
     def _chiama_modello(self, **parametri):
@@ -124,28 +122,41 @@ class DataAgent:
         except BadRequestError as e:
             if "reasoning_effort" not in str(e):
                 raise
-            self._log("MODELLO", "strumenti non ammessi con il ragionamento attivo: riprovo con reasoning_effort=none")
+            self._log("modello_reasoning_none", "strumenti non ammessi con il ragionamento attivo: riprovo con reasoning_effort=none")
             self._reasoning_none = True
             return self.client.chat.completions.create(**parametri, reasoning_effort="none")
 
-    def _log(self, etichetta, testo):
+    def _log(self, evento, testo="", **dati):
+        """Una riga JSON per evento (registro.py); con verbose anche il testo leggibile, per il notebook."""
+        log.info(evento, extra={"dati": {**dati, **({"testo": testo[:2000]} if testo else {})}})
         if self.verbose:
-            print(f"\n[{etichetta}] {testo}")
+            print(f"\n[{evento.upper()}] {testo}")
 
     def analizza(self, domanda: str) -> dict:
-        lavoro = Path(tempfile.mkdtemp(prefix="supplybot_"))
-        try:
-            return self._analizza(domanda, lavoro)
-        finally:
-            shutil.rmtree(lavoro, ignore_errors=True)  # la copia temporanea del dataset non serve piu'
+        chiave = f"{self.dataset.impronta}|{normalizza(domanda)}"
+        salvata = self.cache.leggi(chiave)
+        # una risposta in cache vale solo se i suoi grafici esistono ancora sul disco
+        if salvata and all((CARTELLA_GRAFICI / g).exists() for g in salvata["grafici"]):
+            self._log("risposta_da_cache", domanda)
+            return {**salvata, "da_cache": True}
+        if salvata:
+            self.cache.scarta(chiave)
 
-    def _analizza(self, domanda: str, lavoro: Path) -> dict:
-        percorso_df = None
-        messaggi = [{"role": "system", "content": PROMPT_DI_SISTEMA}, {"role": "user", "content": domanda}]
-        passi, grafici, report = [], [], None
+        inizio = time.perf_counter()
+        risultato = self._analizza(domanda)
+        risultato["durata_ms"] = round((time.perf_counter() - inizio) * 1000)
+        if risultato.get("completata"):
+            self.cache.scrivi(chiave, risultato)
+        return {**risultato, "da_cache": False}
+
+    def _analizza(self, domanda: str) -> dict:
+        percorso_df = self.dataset.percorso_df
+        report = self.dataset.report
+        messaggi = [{"role": "system", "content": self.prompt}, {"role": "user", "content": domanda}]
+        passi, grafici = self.dataset.passi_preparazione(), []
         analisi_eseguite, sollecito_fatto = 0, False
 
-        self._log("DOMANDA", domanda)
+        self._log("domanda", domanda)
         for _ in range(MAX_PASSI):
             risposta = self._chiama_modello(model=self.modello, messages=messaggi, tools=STRUMENTI)
             msg = risposta.choices[0].message
@@ -155,13 +166,13 @@ class DataAgent:
                 # Guardia anti-allucinazione: nessuna risposta senza aver eseguito almeno un'analisi
                 if analisi_eseguite == 0 and not sollecito_fatto:
                     sollecito_fatto = True
-                    self._log("CONTROLLO", "risposta senza analisi eseguite: chiedo di calcolare i numeri")
+                    self._log("controllo_anti_allucinazione", "risposta senza analisi eseguite: chiedo di calcolare i numeri")
                     messaggi.append({"role": "user", "content": "Non hai ancora eseguito nessuna analisi: "
-                                     "i numeri devono venire dal codice. Profila e pulisci il dataset, poi esegui il calcolo."})
+                                     "i numeri devono venire dal codice. Esegui il calcolo con esegui_python."})
                     continue
-                self._log("RISPOSTA", msg.content)
-                return {"sintesi": msg.content, "grafici": grafici, "passi": passi,
-                        "report_pulizia": report, "modello": self.modello}
+                self._log("risposta", msg.content or "", analisi=analisi_eseguite, grafici=len(grafici))
+                return {"sintesi": msg.content, "grafici": grafici, "passi": passi, "report_pulizia": report,
+                        "modello": self.modello, "completata": analisi_eseguite > 0}
 
             for chiamata in msg.tool_calls:
                 nome = chiamata.function.name
@@ -170,31 +181,13 @@ class DataAgent:
                 except json.JSONDecodeError:
                     argomenti = {}
 
-                if nome == "profila_dataset":
-                    profilo = profila_dataset(carica_grezzo())
-                    osservazione = json.dumps(profilo, ensure_ascii=False)
-                    passi.append({"tipo": "profilo", "scopo": "Diagnosi del CSV grezzo", "esito": profilo})
-                    self._log("AZIONE", "profila_dataset")
-                    self._log("OSSERVAZIONE", osservazione)
-
-                elif nome == "pulisci_dataset":
-                    df, report = pulisci_dati(carica_grezzo(), argomenti.get("operazioni") or [])
-                    percorso_df = str(lavoro / "df.pkl")
-                    df.to_pickle(percorso_df)
-                    osservazione = json.dumps(report, ensure_ascii=False)
-                    passi.append({"tipo": "pulizia", "scopo": "Pulizia del dataset", "esito": report})
-                    self._log("AZIONE", f"pulisci_dataset {report['operazioni_applicate']}")
-                    self._log("OSSERVAZIONE", osservazione)
-
-                elif nome == "esegui_python":
+                if nome == "esegui_python":
                     codice, scopo = argomenti.get("codice", ""), argomenti.get("scopo", "")
-                    self._log("PENSIERO", scopo)
-                    self._log("AZIONE", "esegui_python\n" + codice)
-                    if percorso_df is None:
-                        esito = {"ok": False, "output": "", "grafici": [],
-                                 "errore": "Il dataset non e' ancora stato pulito: chiama prima pulisci_dataset."}
-                    else:
-                        esito = esegui(codice, percorso_df, str(CARTELLA_GRAFICI))
+                    self._log("pensiero", scopo)
+                    self._log("azione", "esegui_python\n" + codice)
+                    t0 = time.perf_counter()
+                    esito = esegui(codice, percorso_df, str(CARTELLA_GRAFICI))
+                    self._log("codice_eseguito", ok=esito["ok"], durata_ms=round((time.perf_counter() - t0) * 1000))
                     if esito["ok"]:
                         analisi_eseguite += 1
                         grafici.extend(esito["grafici"])
@@ -203,12 +196,14 @@ class DataAgent:
                         osservazione = f"ERRORE:\n{esito['errore']}\nCorreggi il codice e riprova."
                     passi.append({"tipo": "codice", "scopo": scopo, "codice": codice, "ok": esito["ok"],
                                   "output": esito["output"][:1500], "errore": esito["errore"]})
-                    self._log("OSSERVAZIONE", osservazione[:1500])
+                    self._log("osservazione", osservazione[:1500])
                 else:
                     osservazione = f"Strumento sconosciuto: {nome}"
 
                 messaggi.append({"role": "tool", "tool_call_id": chiamata.id, "content": osservazione})
 
+        self._log("passi_esauriti", domanda)
         return {"sintesi": "Non sono riuscito a completare l'analisi entro il numero massimo di passaggi. "
                            "Prova a riformulare la domanda in modo piu' specifico.",
-                "grafici": grafici, "passi": passi, "report_pulizia": report, "modello": self.modello}
+                "grafici": grafici, "passi": passi, "report_pulizia": report, "modello": self.modello,
+                "completata": False}

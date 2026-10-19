@@ -3,8 +3,9 @@ Test end-to-end dell'architettura: front end escluso, tutto il resto incluso
 (back end Node -> ChromaDB / data agent Python -> grafici).
 
 Verifica che per ogni tipo di domanda l'orchestratore scelga gli strumenti attesi,
-che il data agent diagnostichi e pulisca i dati prima di calcolare, che i grafici
-siano raggiungibili e che la memoria della sessione funzioni.
+che il data agent parta dai dati diagnosticati e puliti all'avvio, che i grafici
+siano raggiungibili, che la memoria della sessione funzioni, che le domande ripetute
+arrivino dalla cache e che le richieste non valide vengano rifiutate.
 
 Uso (con i servizi avviati):
     python tests/test_e2e.py                      # contro il back end su localhost:3001
@@ -15,6 +16,7 @@ Solo libreria standard: nessuna dipendenza da installare.
 
 import json
 import sys
+import urllib.error
 import urllib.request
 import uuid
 
@@ -32,8 +34,11 @@ CASI = [
 def chiama(percorso, dati=None):
     corpo = json.dumps(dati).encode() if dati is not None else None
     req = urllib.request.Request(BASE + percorso, data=corpo, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=300) as r:
-        return r.status, r.read()
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
 
 
 def main():
@@ -48,9 +53,12 @@ def main():
         usati = [t["strumento"] for t in r["trace"]]
         esiti.append((f"Strumenti per «{domanda[:45]}…»: {usati}", usati == attesi))
         for t in r["trace"]:
+            if t["strumento"] == "cerca_manuale":
+                esiti.append(("  il manuale restituisce paragrafi sopra la soglia di pertinenza", bool(t.get("fonti"))))
+        for t in r["trace"]:
             if t["strumento"] == "analizza_dati":
                 tipi = [p["tipo"] for p in t["passi"]]
-                esiti.append(("  il data agent diagnostica e pulisce prima di calcolare",
+                esiti.append(("  diagnosi e pulizia (fatte all'avvio) precedono il calcolo",
                               tipi[:2] == ["profilo", "pulizia"] and "codice" in tipi))
         if vuole_grafico:
             ok = bool(r["charts"])
@@ -58,6 +66,22 @@ def main():
                 stato, png = chiama(r["charts"][0]["url"])
                 ok = stato == 200 and png[:4] == b"\x89PNG"
             esiti.append(("  grafico generato e scaricabile dal back end", ok))
+
+    # la stessa prima domanda, in una conversazione nuova, arriva dalla cache del back end
+    _, corpo = chiama("/api/chat", {"sessionId": "test-" + uuid.uuid4().hex[:12], "message": CASI[0][0]})
+    r = json.loads(corpo)
+    esiti.append(("Prima domanda ripetuta: risposta dalla cache, con request_id",
+                  r.get("cached") is True and bool(r.get("requestId"))))
+    # un'analisi gia' fatta (qui in un'altra conversazione) arriva dalla cache del data agent
+    _, corpo = chiama("/api/chat", {"sessionId": "test-" + uuid.uuid4().hex[:12], "message": CASI[1][0]})
+    r = json.loads(corpo)
+    dati = [t for t in r["trace"] if t["strumento"] == "analizza_dati"]
+    esiti.append(("Analisi ripetuta: risultato dalla cache del data agent", bool(dati) and dati[0].get("daCache") is True))
+
+    # validazione dello schema in ingresso (zod): campi sbagliati o in piu' -> 400
+    stato, _ = chiama("/api/chat", {"sessionId": SESSIONE, "message": "ciao", "admin": True})
+    stato_vuoto, _ = chiama("/api/chat", {"sessionId": SESSIONE, "message": "   "})
+    esiti.append(("Richieste non valide rifiutate con 400", stato == 400 and stato_vuoto == 400))
 
     print(f"\nTest end-to-end su {BASE}\n")
     for descrizione, ok in esiti:

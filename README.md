@@ -43,7 +43,7 @@ SupplyBot è un sistema **gerarchico a due agenti**. Per agente si intende un LL
 | Componente | Ruolo | Agente? |
 | --- | --- | --- |
 | Orchestratore (`backend/`) | Parla con l'utente, tiene la memoria della conversazione, sceglie la strada | **Sì**: LLM con ciclo ReAct e due strumenti |
-| Data agent (`data_agent/`) | Pulisce i dati, scrive ed esegue codice pandas, genera grafici | **Sì**: un secondo LLM con il proprio ciclo ReAct e i propri strumenti (`pulisci_dataset`, `esegui_python`) |
+| Data agent (`data_agent/`) | Valida e pulisce i dati (una volta, all'avvio), scrive ed esegue codice pandas, genera grafici | **Sì**: un secondo LLM con il proprio ciclo ReAct e il proprio strumento (`esegui_python`) |
 | RAG su ChromaDB | Restituisce i paragrafi del manuale più pertinenti | **No**: strumento di recupero, senza LLM |
 
 Il modello è quello **orchestratore–specialista** (*agent as a tool*): l'orchestratore usa il data agent come uno dei suoi strumenti, gli affida un compito completo e ne riceve il risultato. La comunicazione è a senso unico: il data agent non vede la conversazione e non parla con l'utente, per cui l'orchestratore riformula le domande di seguito in domande autonome.
@@ -183,16 +183,23 @@ supplybot/
 │   └── src/App.jsx, styles.css
 ├── backend/                  Orchestratore Node.js
 │   └── src/
-│       ├── server.js         Endpoint /api/chat, /api/charts, /api/health, /api/reset
+│       ├── server.js         Endpoint /api/chat, /api/charts, /api/health, /api/reset, /api/ping
 │       ├── orchestrator.js   Prompt di sistema, strumenti, ciclo ReAct, memoria delle sessioni
 │       ├── rag.js            PDF -> frammenti -> embedding -> ChromaDB; ricerca semantica
 │       ├── ingest.js         Reindicizzazione manuale del manuale
 │       ├── dataAgent.js      Client HTTP verso il servizio Python
 │       ├── limiti.js         Limiti di domande per visitatore e al giorno (versione online)
+│       ├── validazione.js    Schemi zod delle richieste in ingresso
+│       ├── cache.js          Cache LRU con scadenza (risposte e ricerche nel manuale)
+│       ├── logger.js         Log JSON e request_id (AsyncLocalStorage)
 │       └── config.js         Lettura del file .env / variabili d'ambiente
 ├── data_agent/               Microservizio Python
 │   ├── app.py                FastAPI: /analyze, /charts/{nome}, /health
 │   ├── agente_dati.py        Pandas agent: ciclo ReAct con autocorrezione
+│   ├── dataset.py            Dataset letto, validato e pulito una volta all'avvio
+│   ├── schema.py             Contratto dei dati: colonne, tipi, valori ammessi, formati
+│   ├── cache.py              Cache delle analisi gia' eseguite
+│   ├── registro.py           Log JSON con request_id
 │   ├── pulizia.py            Regole di pulizia del dataset, con report delle correzioni
 │   ├── sandbox.py            Controllo ed esecuzione isolata del codice generato
 │   ├── _runner.py            Processo figlio che esegue il codice
@@ -206,7 +213,9 @@ supplybot/
 │   ├── genera_dataset.py             Rigenera il CSV (seme fisso)
 │   └── genera_manuale_pdf.py         Rigenera il PDF dal Markdown
 ├── tests/
-│   ├── test_e2e.py           Test end-to-end dell'architettura (strumenti scelti, pulizia, grafici, memoria)
+│   ├── test_e2e.py           Test end-to-end dell'architettura (strumenti, pulizia, grafici, memoria, cache)
+│   ├── test_data_agent.py    Test unitari del data agent (schema, dataset, cache, seme)
+│   ├── backend.test.js       Test unitari del back end (chunking, soglia, zod, cache)
 │   └── fake_openai.py        Finto server OpenAI per testare tutta la catena senza chiave
 ├── presentazione/            Presentazione del progetto (PDF)
 ├── Dockerfile, render.yaml   Deploy online su Render (vedi "Versione online")
@@ -229,7 +238,7 @@ supplybot/
 - regioni e linee di prodotto scritte in modi diversi (`Emilia Romagna`, `ER`, `lombardia`…);
 - valori mancanti e impossibili (tonnellate negative, prezzi cento volte fuori scala, consegne datate prima dell'ordine).
 
-Il data agent prima li **diagnostica** (`profila_dataset`: quali anomalie e quante), poi **sceglie** le operazioni di pulizia da applicare (`pulisci_dataset`) e dichiara cosa ha corretto. Nei dati sono presenti anche andamenti realistici da scoprire: il picco invernale del sale da disgelo, i ritardi delle navi da Sant'Antioco nei mesi di maltempo, un vettore la cui puntualità peggiora nel 2026.
+All'avvio il data agent **valida lo schema** del CSV (`schema.py`), lo **diagnostica** (`profila_dataset`: quali anomalie e quante), **sceglie** le operazioni di pulizia in base alla diagnosi, lo **pulisce** e valida di nuovo il risultato (`dataset.py`). Ogni risposta riporta cosa è stato corretto. Il CSV si rigenera identico con `python data/genera_dataset.py` (seme esplicito 42, opzione `--seed`). Nei dati sono presenti anche andamenti realistici da scoprire: il picco invernale del sale da disgelo, i ritardi delle navi da Sant'Antioco nei mesi di maltempo, un vettore la cui puntualità peggiora nel 2026.
 
 **`manuale_supply_chain.pdf`**: 10 capitoli (siti, calendario stagionale, scorte, ordini e priorità, trasporti e OTIF, qualità, reclami, imballaggi, FAQ). Contiene le soglie che il dataset permette di verificare: obiettivo OTIF 95%, regola delle 48 ore per le urgenze neve, scorta di disgelo pari al 50% dell'inverno precedente.
 
@@ -239,12 +248,33 @@ Il data agent prima li **diagnostica** (`profila_dataset`: quali anomalie e quan
 
 - **Orchestrazione con l'SDK nativo OpenAI**, senza framework: il ciclo ragiona-agisci-osserva è scritto per intero in `orchestrator.js`, quindi è leggibile e facile da verificare.
 - **Domande autonome per il data agent**: il data agent non vede la conversazione, quindi l'orchestratore riformula le domande di seguito (es. "E per Sant'Antioco?") in domande complete. La memoria resta nel back end, per sessione.
-- **RAG custom**: il PDF è diviso per paragrafi numerati del manuale, una FAQ per frammento. Un controllo sulla numerazione evita di scambiare un elenco puntato per un titolo. Ogni frammento conserva il numero di capitolo, così le risposte citano la fonte (es. *Manuale, cap. 5.3*).
+- **RAG custom**: il PDF è diviso per paragrafi numerati del manuale, una FAQ per frammento. Un controllo sulla numerazione evita di scambiare un elenco puntato per un titolo; il capitolo FAQ si riconosce dal titolo ("Domande frequenti"/"FAQ"), i paragrafi troppo lunghi si dividono in blocchi e un PDF senza titoli numerati viene diviso in blocchi a lunghezza fissa con sovrapposizione. Ogni frammento conserva il numero di capitolo, così le risposte citano la fonte (es. *Manuale, cap. 5.3*).
+- **Indice del manuale versionato**: il nome della collezione Chroma contiene l'impronta dei frammenti. Se il manuale o il chunking cambiano si crea una collezione nuova e quella in uso non viene mai cancellata, così la versione locale e quella online possono condividere lo stesso database senza sovrascriversi.
+- **Soglia di pertinenza nel RAG**: dei 4 frammenti più vicini si tengono solo quelli con somiglianza ≥ 0,30 (`SOGLIA_SIMILARITA`). Una domanda fuori tema riceve "nessun risultato pertinente" invece di capitoli lontani da citare a sproposito; i frammenti scartati compaiono nel pannello "Come ho risposto".
 - **Pandas agent come interprete deterministico**: l'LLM scrive il codice pandas, ma i numeri li calcola Python. È implementato con il function calling nativo invece che con `create_pandas_dataframe_agent` di LangChain: stesso schema (l'LLM scrive codice, un interprete lo esegue, l'LLM legge il risultato), ma con pieno controllo su sandbox, tempo massimo, autocorrezione e traccia dei passi.
-- **Data cleaning deciso dall'agente**: l'agente diagnostica il CSV grezzo e sceglie quali operazioni di pulizia applicare in base alle anomalie trovate; ogni operazione è scritta in codice testato (`pulizia.py`), così il risultato è riproducibile. I valori impossibili vengono resi mancanti, mai inventati.
+- **Dataset preparato una volta, all'avvio** (`dataset.py`): lettura del CSV, validazione dello schema, diagnosi, scelta delle pulizie in base alla diagnosi (ogni anomalia trovata attiva l'operazione che la corregge), pulizia e validazione rigida del risultato. Il dataframe pronto resta in memoria e su disco: ogni domanda parte da lì, senza rileggere il CSV e senza spendere passi LLM per ripulire dati che non cambiano. Ogni operazione è scritta in codice testato (`pulizia.py`); i valori impossibili vengono resi mancanti, mai inventati.
+- **Contratto dei dati** (`schema.py`): colonne obbligatorie, tipi, valori ammessi e formati. Sul CSV grezzo le anomalie correggibili sono avvisi; colonne mancanti o colonne in gran parte illeggibili sono errori. Se il CSV non è valido il data agent non analizza nulla e risponde 503 con l'elenco degli errori, invece di dare numeri sbagliati.
+- **Cache delle risposte**: le domande già viste non rifanno il lavoro. Tre livelli: risposta completa alla prima domanda di una conversazione (back end), ricerche nel manuale (back end), analisi del data agent (servizio Python, chiave = domanda + impronta del CSV). Cache in memoria con dimensione massima e scadenza (6 ore); le risposte con errori o con analisi non concluse non si salvano. Limite noto: se si cambia il CSV del data agent senza riavviare il back end, le risposte complete già in cache nel back end restano valide fino alla scadenza (online i due processi si riavviano insieme, quindi il problema non si pone).
+- **Validazione degli ingressi con zod** al confine dell'API (`validazione.js`): `/api/chat` accetta solo `sessionId` e `message` nel formato atteso, nient'altro. Lo stesso schema fornisce i tipi al controllo statico.
+- **Controllo dei tipi con TypeScript sul JavaScript** (`npm run typecheck`, `tsconfig.json` con `checkJs`): TypeScript legge le annotazioni JSDoc e i tipi di zod senza compilare nulla. È il primo passo verso una migrazione completa a TypeScript.
+- **Log strutturati e ID di correlazione**: entrambi i servizi scrivono una riga JSON per evento (`logger.js`, `registro.py`). Il back end assegna un `request_id` a ogni domanda e lo passa al data agent nell'intestazione `X-Request-Id`: filtrando i log per quell'ID si ricostruisce tutto il percorso di una domanda. L'ID compare anche in fondo al pannello "Come ho risposto".
 - **Glossario aziendale nei prompt**: le definizioni del manuale (stagione invernale = novembre-febbraio, OTIF, volumi = tonnellate consegnate) sono scritte nei prompt, perché nelle prove con il modello reale l'LLM tendeva a usare definizioni proprie.
 - **Autocorrezione**: se il codice generato va in errore, il traceback torna all'LLM, che lo corregge e riprova.
 - **Guardia anti-allucinazione**: se il data agent prova a rispondere senza aver eseguito nessun calcolo, viene rimandato a calcolare.
+
+### Miglioramenti dopo la revisione dei docenti
+
+| Osservazione | Cosa è cambiato | Dove |
+| --- | --- | --- |
+| Il CSV veniva riletto (`pd.read_csv`) a ogni richiesta | Letto una sola volta all'avvio; un test verifica che durante le domande non venga mai riletto | `dataset.py`, `tests/test_data_agent.py` |
+| Diagnosi e pulizia ripetute a ogni domanda (passi LLM, CPU, latenza) | Eseguite una volta all'avvio; l'agente parte dal dataframe pronto (2 chiamate LLM in meno per domanda) | `dataset.py`, `agente_dati.py` |
+| Manca la validazione dello schema del CSV | Contratto dei dati con colonne, tipi, valori ammessi e formati; CSV non valido = errore 503 con l'elenco dei problemi | `schema.py`, `app.py` |
+| Seed del generatore da rendere esplicito | Seme esplicito come unica fonte di casualità, opzione `--seed`, impronta SHA-256 stampata e verificata dai test | `genera_dataset.py` |
+| Cache delle risposte | Tre livelli di cache con dimensione massima e scadenza | `cache.js`, `cache.py` |
+| RAG senza soglia di somiglianza | Soglia 0,30: sotto, "nessun risultato pertinente" | `rag.js` |
+| Chunking legato al formato del PDF (FAQ = capitolo 10) | FAQ riconosciute dal titolo, paragrafi lunghi divisi, ripiego a blocchi con sovrapposizione; l'indice si ricostruisce se i frammenti cambiano | `rag.js` |
+| `console.log` non strutturati, nessuna correlazione tra i servizi | Log JSON e `request_id` propagato dal back end al data agent | `logger.js`, `registro.py`, `dataAgent.js` |
+| Back end in JavaScript senza validazione dei tipi | zod su `/api/chat` e `/api/reset`; controllo dei tipi TypeScript (`checkJs`) | `validazione.js`, `tsconfig.json` |
 
 ## Problemi incontrati e soluzioni
 
@@ -267,11 +297,21 @@ Il data agent prima li **diagnostica** (`profila_dataset`: quali anomalie e quan
 
   È una protezione adeguata a un servizio dimostrativo, non una sandbox da produzione: per quello servirebbe un container isolato per ogni esecuzione.
 - **Versione online**: le chiavi sono variabili d'ambiente di Render e non stanno né nel repository né nell'immagine (`.dockerignore` esclude ogni `.env`); il data agent ascolta solo all'interno del container; limiti di utilizzo e timeout proteggono i costi (vedi "Versione online").
-- **Input validati**: lunghezza dei messaggi, formato dell'id di sessione, nomi dei file dei grafici. Il front end parla solo con il back end, che inoltra le immagini dal servizio Python.
+- **Input validati**: schema zod sulle richieste (`validazione.js`: formato dell'id di sessione, lunghezza dei messaggi, nessun campo in più), nomi dei file dei grafici, schema del CSV (`schema.py`). Il front end parla solo con il back end, che inoltra le immagini dal servizio Python.
 
 ## Test
 
-`tests/test_e2e.py` verifica l'intera architettura a servizi avviati: per quattro domande tipo controlla gli strumenti scelti dall'orchestratore, che il data agent diagnostichi e pulisca i dati prima di calcolare, che i grafici siano scaricabili e che la memoria della sessione funzioni. Usa solo la libreria standard di Python:
+**Test unitari** (nessuna chiave, nessun servizio da avviare):
+
+```bat
+.venv\Scripts\python -m unittest tests\test_data_agent.py -v
+cd backend && npm test && npm run typecheck
+```
+
+- `tests/test_data_agent.py`: validazione dello schema (CSV valido, colonna mancante, valori sconosciuti, date illeggibili, codici fuori formato), validazione rigida dopo la pulizia, scelta delle pulizie dalla diagnosi, CSV non riletto durante le domande, cache del data agent, riproducibilità del generatore con lo stesso seme;
+- `tests/backend.test.js`: chunking del manuale (29 frammenti, FAQ riconosciute dal titolo, ripiego a blocchi), soglia di somiglianza, schema zod, cache LRU con scadenza.
+
+**Test end-to-end** (`tests/test_e2e.py`, a servizi avviati): per quattro domande tipo controlla gli strumenti scelti dall'orchestratore, che diagnosi e pulizia precedano il calcolo, che i grafici siano scaricabili, che la memoria della sessione funzioni, che le domande ripetute arrivino dalla cache e che le richieste non valide vengano rifiutate. Usa solo la libreria standard di Python:
 
 ```bat
 python tests\test_e2e.py
@@ -285,6 +325,8 @@ python tests\test_e2e.py
 python tests\fake_openai.py
 REM in ogni terminale dei servizi, prima dell'avvio:
 set OPENAI_BASE_URL=http://localhost:9999/v1
+REM gli embedding finti sono piu' grezzi di quelli veri: soglia RAG piu' bassa solo per questo test
+set SOGLIA_SIMILARITA=0.2
 ```
 
 ## Problemi frequenti
@@ -293,7 +335,8 @@ set OPENAI_BASE_URL=http://localhost:9999/v1
 | --- | --- |
 | Il back end si chiude con "OPENAI_API_KEY mancante" | Manca il file `.env` o la chiave: copia `.env.example` in `.env` e compilalo |
 | "ChromaDB non risponde su localhost:8001" | Avvia ChromaDB prima del back end (passo 1) |
-| Indicatore *Dati* rosso | Il data agent non è avviato o è su un'altra porta: controlla il terminale del passo 2 |
+| Indicatore *Dati* rosso | Il data agent non è avviato o è su un'altra porta: controlla il terminale del passo 2. Se il terminale mostra `servizio_senza_dataset`, il CSV non ha superato la validazione dello schema: gli errori sono elencati nella stessa riga |
+| Ricostruire cosa è successo a una domanda | Copia l'"ID richiesta" in fondo al pannello "Come ho risposto" e cercalo nei log dei due servizi |
 | Errore sul modello nella risposta | Il modello in `OPENAI_MODEL` non è disponibile per il tuo account: indicane un altro presente nella tua dashboard OpenAI |
 | Errore 400 "Function tools with reasoning_effort are not supported" | Gestito in automatico: il servizio riprova con `reasoning_effort=none`. Se compare comunque, aggiungi `OPENAI_REASONING_EFFORT=none` al `.env` |
 | `chroma` non riconosciuto come comando | Attiva l'ambiente `.venv` oppure usa `.venv\Scripts\chroma.exe` |

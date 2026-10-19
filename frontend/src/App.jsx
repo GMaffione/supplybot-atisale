@@ -76,11 +76,12 @@ function StatoServizi() {
   );
 }
 
-function Traccia({ traccia }) {
+function Traccia({ traccia, daCache, requestId }) {
   if (!traccia?.length) return null;
   return (
     <details className="traccia">
       <summary>Come ho risposto</summary>
+      {daCache && <p className="tenue">Domanda già vista: risposta servita dalla cache, senza ripetere l'analisi.</p>}
       <ol>
         {traccia.map((t, i) => (
           <li key={i}>
@@ -89,7 +90,7 @@ function Traccia({ traccia }) {
                 <p>
                   <strong>Ricerca nel manuale:</strong> “{t.input}”
                 </p>
-                {t.fonti && (
+                {t.fonti?.length > 0 && (
                   <ul className="fonti">
                     {t.fonti.map((f, j) => (
                       <li key={j}>
@@ -98,6 +99,12 @@ function Traccia({ traccia }) {
                     ))}
                   </ul>
                 )}
+                {t.fonti?.length === 0 && <p className="tenue">Nessun paragrafo abbastanza pertinente: il manuale non è stato citato.</p>}
+                {t.scartate?.length > 0 && (
+                  <p className="tenue">
+                    Scartati perché sotto la soglia di pertinenza {t.soglia}: {t.scartate.map((f) => `cap. ${f.sezione} (${f.somiglianza})`).join(", ")}.
+                  </p>
+                )}
               </>
             )}
             {t.strumento === "analizza_dati" && (
@@ -105,6 +112,7 @@ function Traccia({ traccia }) {
                 <p>
                   <strong>Analisi delegata al data agent:</strong> “{t.input}”
                 </p>
+                {t.daCache && <p className="tenue">Analisi già eseguita in precedenza: risultato dalla cache del data agent.</p>}
                 {t.autocorrezioni > 0 && (
                   <p className="tenue">
                     Il codice è andato in errore {t.autocorrezioni} {t.autocorrezioni === 1 ? "volta" : "volte"} ed è stato corretto in automatico.
@@ -116,7 +124,7 @@ function Traccia({ traccia }) {
                     const impossibili = (e.quantita_negative ?? 0) + (e.prezzi_fuori_scala ?? 0) + (e.consegne_prima_dell_ordine ?? 0);
                     return (
                       <p key={j} className="tenue">
-                        Diagnosi del CSV: {e.duplicati_esatti} duplicati, {e.date_ordine_formato_gg_mm_aaaa} date in formato diverso,{" "}
+                        Diagnosi del CSV all'avvio del servizio (schema {e.validazione_schema?.valido === false ? "non valido" : "valido"}): {e.duplicati_esatti} duplicati, {e.date_ordine_formato_gg_mm_aaaa} date in formato diverso,{" "}
                         {e.linee_prodotto_scritte_in_modo_non_standard + e.regioni_scritte_in_modo_non_standard} testi incoerenti, {impossibili} valori impossibili.
                       </p>
                     );
@@ -126,7 +134,7 @@ function Traccia({ traccia }) {
                     const fatte = (p.esito.operazioni_applicate ?? []).map((o) => nomi[o] ?? o);
                     return (
                       <p key={j} className="tenue">
-                        Pulizia scelta dall'agente: {["date e numeri convertiti", ...fatte].join(", ")}.
+                        Pulizia scelta in base alla diagnosi, eseguita una volta all'avvio: {["date e numeri convertiti", ...fatte].join(", ")}.
                       </p>
                     );
                   }
@@ -146,6 +154,7 @@ function Traccia({ traccia }) {
           </li>
         ))}
       </ol>
+      {requestId && <p className="tenue id-richiesta">ID richiesta: {requestId}</p>}
     </details>
   );
 }
@@ -172,7 +181,7 @@ function Messaggio({ m }) {
           </a>
         </figure>
       ))}
-      <Traccia traccia={m.traccia} />
+      <Traccia traccia={m.traccia} daCache={m.daCache} requestId={m.requestId} />
     </article>
   );
 }
@@ -227,7 +236,10 @@ export default function App() {
         return;
       }
       if (!r.ok) throw new Error(dati.error || `Errore ${r.status}`);
-      setMessaggi((m) => [...m, { ruolo: "assistente", testo: dati.reply, grafici: dati.charts, traccia: dati.trace }]);
+      setMessaggi((m) => [
+        ...m,
+        { ruolo: "assistente", testo: dati.reply, grafici: dati.charts, traccia: dati.trace, daCache: dati.cached, requestId: dati.requestId },
+      ]);
     } catch (e) {
       setMessaggi((m) => [
         ...m,

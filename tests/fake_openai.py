@@ -60,13 +60,7 @@ def chiamata(nome, argomenti):
 def risposta_data_agent(messaggi):
     domanda = next(m["content"] for m in messaggi if m["role"] == "user").lower()
     tool = [m for m in messaggi if m["role"] == "tool"]
-    if not tool:
-        return None, [chiamata("profila_dataset", {})]
-    ultimo_nome = [m for m in messaggi if m["role"] == "assistant" and m.get("tool_calls")][-1]["tool_calls"][0]["function"]["name"]
-    if ultimo_nome == "profila_dataset":
-        return None, [chiamata("pulisci_dataset", {"operazioni": ["rimuovi_duplicati", "normalizza_testi",
-                                                                   "neutralizza_valori_impossibili"]})]
-    ultimo = tool[-1]["content"]
+    ultimo = tool[-1]["content"] if tool else ""
     codici_eseguiti = sum(1 for m in messaggi if m["role"] == "assistant" and m.get("tool_calls")
                           and m["tool_calls"][0]["function"]["name"] == "esegui_python")
     chiave = "disgelo" if "disgelo" in domanda else "otif"
