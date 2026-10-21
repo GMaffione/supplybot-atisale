@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 process.env.OPENAI_API_KEY ??= "chiave-finta-per-i-test"; // config.js la richiede; qui non si chiama OpenAI
 
 const { dividiInFrammenti, dividiInBlocchi, filtraPerSoglia, estraiTesto } = await import("../backend/src/rag.js");
-const { schemaChat, valida } = await import("../backend/src/validazione.js");
+const { schemaChat, schemaReset, valida } = await import("../backend/src/validazione.js");
 const { CacheLRU, normalizza } = await import("../backend/src/cache.js");
 const { config } = await import("../backend/src/config.js");
 
@@ -69,14 +69,73 @@ test("zod: /api/chat accetta solo sessionId e message validi", () => {
   assert.equal(valida(schemaChat, null).ok, false);
 });
 
-test("cache: LRU con scadenza e chiavi normalizzate", async () => {
-  const cache = new CacheLRU({ massimo: 2, durataMs: 50 });
+test("zod, casi limite: lunghezza del messaggio esattamente al massimo", () => {
+  const max = config.maxCaratteriDomanda;
+  const id = "sessione-123";
+  assert.equal(valida(schemaChat, { sessionId: id, message: "x".repeat(max) }).ok, true);
+  assert.equal(valida(schemaChat, { sessionId: id, message: "x".repeat(max + 1) }).ok, false);
+  // gli spazi ai bordi si tolgono PRIMA di contare: max caratteri utili + spazi = valido
+  const conSpazi = valida(schemaChat, { sessionId: id, message: `   ${"x".repeat(max)}   ` });
+  assert.equal(conSpazi.ok, true);
+  assert.equal(/** @type {any} */ (conSpazi).dati.message.length, max);
+  assert.equal(valida(schemaChat, { sessionId: id, message: "a" }).ok, true); // un solo carattere basta
+  assert.equal(valida(schemaChat, { sessionId: id, message: "\n\t  " }).ok, false); // solo spazi e a capo
+});
+
+test("zod, casi limite: formato dell'id di sessione", () => {
+  const conId = (sessionId) => valida(schemaChat, { sessionId, message: "ciao" }).ok;
+  assert.equal(conId("a".repeat(7)), false); // troppo corto
+  assert.equal(conId("a".repeat(8)), true); // minimo
+  assert.equal(conId("a".repeat(64)), true); // massimo
+  assert.equal(conId("a".repeat(65)), false); // troppo lungo
+  assert.equal(conId("sessione_123"), false); // trattino basso non ammesso
+  assert.equal(conId("sessione 123"), false); // spazio
+  assert.equal(conId("sessione-àèì"), false); // lettere accentate
+  assert.equal(conId("../../etc/x"), false); // percorsi
+  assert.equal(conId(12345678), false); // numero invece di testo
+});
+
+test("zod, casi limite: corpo della richiesta di forma sbagliata", () => {
+  for (const corpo of [null, undefined, "testo", 42, [], [{ sessionId: "sessione-123", message: "ciao" }]]) {
+    assert.equal(valida(schemaChat, corpo).ok, false, `deve rifiutare ${JSON.stringify(corpo)}`);
+  }
+  assert.equal(valida(schemaChat, { sessionId: "sessione-123", message: null }).ok, false);
+  assert.equal(valida(schemaChat, { sessionId: "sessione-123", message: ["ciao"] }).ok, false);
+  assert.equal(valida(schemaChat, { sessionId: "sessione-123", message: "Il disgelo ❄️ a gennaio?" }).ok, true); // emoji ok
+});
+
+test("zod: /api/reset accetta solo un sessionId valido", () => {
+  assert.equal(valida(schemaReset, { sessionId: "sessione-123" }).ok, true);
+  assert.equal(valida(schemaReset, { sessionId: "x" }).ok, false);
+  assert.equal(valida(schemaReset, { sessionId: "sessione-123", message: "ciao" }).ok, false); // campo in piu'
+  assert.equal(valida(schemaReset, {}).ok, false);
+});
+
+test("cache: LRU, scadenza e chiavi normalizzate", () => {
+  let ora = 0;
+  const cache = new CacheLRU({ massimo: 2, durataMs: 1000, orologio: () => ora });
   cache.scrivi(normalizza("Quali vettori?"), 1);
   cache.scrivi("b", 2);
-  assert.equal(cache.leggi("quali vettori"), 1); // stessa domanda scritta in modo diverso
-  cache.scrivi("c", 3); // supera il massimo: si scarta "b", la meno usata di recente
+  assert.equal(cache.leggi("quali vettori"), 1); // stessa domanda scritta in modo diverso; "b" diventa la meno usata
+  cache.scrivi("c", 3); // supera il massimo: si scarta "b"
   assert.equal(cache.leggi("b"), undefined);
   assert.equal(cache.leggi("c"), 3);
-  await new Promise((r) => setTimeout(r, 60));
-  assert.equal(cache.leggi("c"), undefined); // scaduta
+  ora = 1000;
+  assert.equal(cache.leggi("c"), 3); // esattamente alla scadenza: ancora valida
+  ora = 1001;
+  assert.equal(cache.leggi("c"), undefined); // un millisecondo dopo: scaduta
+  assert.equal(cache.stato().scadute, 1);
+  cache.scrivi("d", 4);
+  cache.svuota();
+  assert.equal(cache.stato().voci, 0); // svuotata, come dopo un riavvio
+});
+
+test("cache: riscrivere una voce ne aggiorna valore e scadenza", () => {
+  let ora = 0;
+  const cache = new CacheLRU({ durataMs: 1000, orologio: () => ora });
+  cache.scrivi("a", "vecchio");
+  ora = 900;
+  cache.scrivi("a", "nuovo");
+  ora = 1500; // 1500 ms dalla prima scrittura, 600 dalla seconda
+  assert.equal(cache.leggi("a"), "nuovo");
 });

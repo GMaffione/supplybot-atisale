@@ -97,13 +97,23 @@ async function chiamaModello(parametri) {
 // Memoria delle conversazioni: per ogni sessione si tengono gli ultimi scambi utente/assistente.
 const sessioni = new Map();
 
-// Cache delle risposte complete alla PRIMA domanda di una conversazione (senza storia la risposta
-// dipende solo dalla domanda). Le domande successive non si mettono qui: "E per Sant'Antioco?"
-// significa cose diverse in conversazioni diverse.
+// Cache delle risposte complete, SOLO per la PRIMA domanda di una conversazione: senza storia la risposta
+// dipende solo dalla domanda. Regole (verificate da tests/cache.test.js):
+//   - entra in cache: la risposta alla prima domanda, se nessuno strumento ha dato errore e se il data
+//     agent, quando usato, ha concluso l'analisi;
+//   - non entra mai: le domande successive ("E per Sant'Antioco?" significa cose diverse in conversazioni
+//     diverse), le risposte con errori, le analisi non concluse;
+//   - si invalida: al riavvio del servizio (e' in memoria), dopo 6 ore, quando supera 200 voci (LRU)
+//     o con svuotaCacheRisposte(). Vedi cache.js e la sezione "Cache" del README.
 const cacheRisposte = new CacheLRU({ massimo: 200 });
 
 export function statoCacheRisposte() {
   return cacheRisposte.stato();
+}
+
+/** Svuota la cache delle risposte complete (stesso effetto di un riavvio). */
+export function svuotaCacheRisposte() {
+  cacheRisposte.svuota();
 }
 
 function ricordaScambio(idSessione, storia, messaggioUtente, risposta) {

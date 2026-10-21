@@ -8,7 +8,7 @@
     "start": "node src/server.js",
     "ingest": "node src/ingest.js",
     "typecheck": "tsc -p .",
-    "test": "node --test ../tests/backend.test.js"
+    "test": "node --test ../tests/backend.test.js ../tests/cache.test.js"
   },
   "engines": {
     "node": ">=20"

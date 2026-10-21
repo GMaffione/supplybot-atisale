@@ -1,6 +1,7 @@
 """
-Test unitari del data agent: validazione dello schema, dataset preparato una volta,
-cache delle risposte, riproducibilita' del generatore.
+Test unitari del data agent: validazione dello schema (anche nei casi limite), dataset
+preparato una volta, cache delle risposte e sua invalidazione, API (validazione delle
+richieste e request_id), riproducibilita' del generatore.
 
 Niente chiave OpenAI e niente rete: l'LLM e' sostituito da un finto client che chiama
 lo strumento esegui_python e poi risponde. Solo libreria standard (unittest).
@@ -9,6 +10,8 @@ Uso (dalla radice del progetto):  python -m unittest tests/test_data_agent.py -v
 """
 
 import hashlib
+import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -48,7 +51,8 @@ class FintoLLM:
         else:
             msg = {"role": "assistant", "content": None, "tool_calls": [{
                 "id": f"call_{self.chiamate}", "type": "function",
-                "function": {"name": "esegui_python", "arguments": f'{{"scopo": "somma", "codice": "{CODICE}"}}'}}]}
+                "function": {"name": "esegui_python",
+                             "arguments": json.dumps({"scopo": "calcolo", "codice": CODICE})}}]}
         return ChatCompletion.model_validate({
             "id": "x", "object": "chat.completion", "created": 0, "model": "finto",
             "choices": [{"index": 0, "finish_reason": "stop", "message": msg}]})
@@ -167,6 +171,222 @@ class TestCache(unittest.TestCase):
         scaduta = CacheRisposte(durata_secondi=0)
         scaduta.scrivi("a", {})
         self.assertIsNone(scaduta.leggi("a"))
+
+
+class FintoLLMSenzaCalcoli(FintoLLM):
+    """Risponde sempre a parole, senza mai eseguire codice: l'analisi resta non conclusa."""
+
+    def create(self, **parametri):
+        self.chiamate += 1
+        return ChatCompletion.model_validate({
+            "id": "x", "object": "chat.completion", "created": 0, "model": "finto",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "Circa 5.000 t, a occhio."}}]})
+
+
+class OrologioFinto:
+    """Orologio controllabile: permette di far 'passare' ore in un istante."""
+
+    def __init__(self):
+        self.ora = 1000.0
+
+    def __call__(self):
+        return self.ora
+
+
+class TestValidazioneCasiLimite(unittest.TestCase):
+    """Il confine tra anomalia correggibile (avviso) e file da rifiutare (errore)."""
+
+    def setUp(self):
+        self.grezzo = carica_grezzo(CSV)
+        self.n = len(self.grezzo)
+
+    def _con(self, colonna, valore, quante):
+        df = self.grezzo.copy()
+        df.loc[df.index[:quante], colonna] = valore
+        return valida_grezzo(df)
+
+    def test_soglia_del_5_per_cento_esatta(self):
+        massimo_tollerato = int(self.n * 0.05)               # 75 righe su 1.501: ancora avviso
+        al_limite = self._con("status", "Smarrita", massimo_tollerato)
+        oltre = self._con("status", "Smarrita", massimo_tollerato + 1)
+        self.assertTrue(al_limite["valido"], al_limite["errori"])
+        self.assertTrue(any(a.startswith("status") for a in al_limite["avvisi"]))
+        self.assertFalse(oltre["valido"])
+
+    def test_solo_intestazione_senza_righe(self):
+        esito = valida_grezzo(self.grezzo.iloc[0:0])
+        self.assertFalse(esito["valido"])
+        self.assertIn("non contiene righe", esito["errori"][0])
+
+    def test_colonna_in_piu_e_solo_un_avviso(self):
+        df = self.grezzo.copy()
+        df["note_interne"] = "x"
+        esito = valida_grezzo(df)
+        self.assertTrue(esito["valido"])
+        self.assertTrue(any("note_interne" in a for a in esito["avvisi"]))
+
+    def test_obbligatorio_mancante_sotto_e_sopra_soglia(self):
+        self.assertTrue(self._con("carrier", "", 10)["valido"])                    # pochi vuoti: avviso
+        self.assertFalse(self._con("carrier", "", int(self.n * 0.05) + 1)["valido"])  # troppi: errore
+
+    def test_colonna_facoltativa_vuota_non_e_un_errore(self):
+        self.assertTrue(self._con("delivery_date", "", 400)["valido"])  # vuota se non ancora consegnata
+
+    def test_formati_di_data_ammessi_e_data_impossibile(self):
+        self.assertTrue(self._con("order_date", "07/01/2025", 300)["valido"])  # gg/mm/aaaa e' ammesso
+        esito = self._con("order_date", "31/02/2025", 3)                        # il 31 febbraio non esiste
+        self.assertTrue(esito["valido"])
+        self.assertTrue(any("order_date: 3 date illeggibili" in a for a in esito["avvisi"]))
+
+    def test_numeri_scritti_come_testo(self):
+        self.assertTrue(self._con("price_eur_t", "€ 85,40", 300)["valido"])   # convertibile: nessun problema
+        esito = self._con("price_eur_t", "ottanta", 5)
+        self.assertTrue(any("price_eur_t: 5 valori non numerici" in a for a in esito["avvisi"]))
+
+    def test_spazi_e_maiuscole_nelle_categorie_correggibili(self):
+        esito = self._con("product_line", "  DISGELO STRADALE ", 300)
+        self.assertTrue(esito["valido"])
+        self.assertFalse(any(a.startswith("product_line") for a in esito["avvisi"]))
+
+    def test_codice_spedizione_al_limite_del_formato(self):
+        self.assertTrue(self._con("shipment_id", "SP-2025-99999", 1)["valido"])
+        self.assertFalse(self._con("shipment_id", "SP-2025-9999", 1)["valido"])    # 4 cifre invece di 5
+        self.assertFalse(self._con("shipment_id", "sp-2025-00001", 1)["valido"])   # minuscolo
+
+    def test_file_mancante_o_non_testuale(self):
+        for percorso in (Path(tempfile.mkdtemp()) / "non_esiste.csv", Path(sys.executable)):
+            modulo_dataset.azzera()
+            with self.assertRaises(DatasetNonValido) as e:
+                modulo_dataset.prepara(percorso)
+            self.assertEqual(e.exception.fase, "lettura del CSV")
+        modulo_dataset.azzera()
+
+
+class TestInvalidazioneCache(unittest.TestCase):
+    """Quando una risposta in cache smette di valere."""
+
+    DOMANDA = "Quante tonnellate abbiamo consegnato?"
+
+    def setUp(self):
+        modulo_dataset.azzera()
+        self.dati = modulo_dataset.prepara(CSV)
+
+    def tearDown(self):
+        modulo_dataset.azzera()
+
+    def test_scadenza_dopo_sei_ore(self):
+        orologio, llm = OrologioFinto(), FintoLLM()
+        agente = DataAgent(client=llm, dataset=self.dati, cache=CacheRisposte(orologio=orologio))
+        agente.analizza(self.DOMANDA)
+        orologio.ora += 6 * 3600 - 1
+        self.assertTrue(agente.analizza(self.DOMANDA)["da_cache"])   # un secondo prima: ancora valida
+        orologio.ora += 2
+        self.assertFalse(agente.analizza(self.DOMANDA)["da_cache"])  # scaduta: ricalcolata
+        self.assertEqual(agente.cache.stato()["scadute"], 1)
+
+    def test_riavvio_svuota_la_cache(self):
+        llm = FintoLLM()
+        prima = DataAgent(client=llm, dataset=self.dati, cache=CacheRisposte())
+        prima.analizza(self.DOMANDA)
+        self.assertTrue(prima.analizza(self.DOMANDA)["da_cache"])
+        # un riavvio crea un nuovo agente con una cache nuova (in memoria): la risposta va ricalcolata
+        dopo_il_riavvio = DataAgent(client=llm, dataset=self.dati)
+        self.assertFalse(dopo_il_riavvio.analizza(self.DOMANDA)["da_cache"])
+
+    def test_svuota_esplicito(self):
+        agente = DataAgent(client=FintoLLM(), dataset=self.dati, cache=CacheRisposte())
+        agente.analizza(self.DOMANDA)
+        agente.cache.svuota()
+        self.assertFalse(agente.analizza(self.DOMANDA)["da_cache"])
+
+    def test_lru_scarta_la_meno_usata_di_recente(self):
+        cache = CacheRisposte(massimo=2)
+        cache.scrivi("a", {"n": 1})
+        cache.scrivi("b", {"n": 2})
+        cache.leggi("a")              # "a" usata adesso: la meno recente diventa "b"
+        cache.scrivi("c", {"n": 3})
+        self.assertIsNone(cache.leggi("b"))
+        self.assertEqual(cache.leggi("a"), {"n": 1})
+
+    def test_grafico_cancellato_forza_il_ricalcolo(self):
+        llm = FintoLLM()
+        llm_codice = "import matplotlib.pyplot as plt\nfig, ax = plt.subplots()\nax.bar([1], [1])\nsalva_grafico('t')"
+        agente = DataAgent(client=llm, dataset=self.dati, cache=CacheRisposte())
+        with mock.patch(f"{__name__}.CODICE", llm_codice):
+            prima = agente.analizza(self.DOMANDA)
+            self.assertEqual(len(prima["grafici"]), 1)
+            from agente_dati import CARTELLA_GRAFICI
+            (CARTELLA_GRAFICI / prima["grafici"][0]).unlink()
+            seconda = agente.analizza(self.DOMANDA)
+        self.assertFalse(seconda["da_cache"])
+        self.assertTrue((CARTELLA_GRAFICI / seconda["grafici"][0]).exists())
+
+    def test_csv_diverso_non_riusa_le_risposte(self):
+        cache, llm = CacheRisposte(), FintoLLM()
+        DataAgent(client=llm, dataset=self.dati, cache=cache).analizza(self.DOMANDA)
+        modulo_dataset.azzera()
+        altro_csv = csv_modificato(lambda df: df.iloc[:-1])   # una riga in meno: impronta diversa
+        altri_dati = modulo_dataset.prepara(altro_csv)
+        self.assertNotEqual(altri_dati.impronta, self.dati.impronta)
+        risposta = DataAgent(client=llm, dataset=altri_dati, cache=cache).analizza(self.DOMANDA)
+        self.assertFalse(risposta["da_cache"])
+
+    def test_analisi_non_conclusa_non_entra_in_cache(self):
+        llm = FintoLLMSenzaCalcoli()
+        agente = DataAgent(client=llm, dataset=self.dati, cache=CacheRisposte())
+        prima = agente.analizza(self.DOMANDA)
+        self.assertFalse(prima["completata"])
+        self.assertFalse(agente.analizza(self.DOMANDA)["da_cache"])
+        self.assertEqual(agente.cache.stato()["voci"], 0)
+
+    def test_domande_diverse_non_si_confondono(self):
+        agente = DataAgent(client=FintoLLM(), dataset=self.dati, cache=CacheRisposte())
+        agente.analizza(self.DOMANDA)
+        self.assertTrue(agente.analizza("  QUANTE tonnellate abbiamo consegnato  ")["da_cache"])  # stessa domanda
+        self.assertFalse(agente.analizza("Quante tonnellate abbiamo ordinato?")["da_cache"])      # domanda diversa
+
+
+class TestApi(unittest.TestCase):
+    """Il confine HTTP del data agent: validazione delle richieste e ID di correlazione."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("OPENAI_API_KEY", "chiave-finta-per-i-test")
+        modulo_dataset.azzera()
+        from fastapi.testclient import TestClient
+        import app as modulo_app
+        cls.modulo_app = modulo_app
+        cls.client = TestClient(modulo_app.app).__enter__()  # avvia il servizio (prepara il dataset)
+        modulo_app.agente.analizza = lambda domanda: {"sintesi": domanda, "grafici": [], "passi": [], "da_cache": False}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+        modulo_dataset.azzera()
+
+    def test_lunghezza_della_domanda_ai_limiti(self):
+        self.assertEqual(self.client.post("/analyze", json={"domanda": "ab"}).status_code, 422)
+        self.assertEqual(self.client.post("/analyze", json={"domanda": "abc"}).status_code, 200)
+        self.assertEqual(self.client.post("/analyze", json={"domanda": "x" * 2000}).status_code, 200)
+        self.assertEqual(self.client.post("/analyze", json={"domanda": "x" * 2001}).status_code, 422)
+
+    def test_richieste_malformate(self):
+        self.assertEqual(self.client.post("/analyze", json={}).status_code, 422)
+        self.assertEqual(self.client.post("/analyze", json={"domanda": 42}).status_code, 422)
+        self.assertEqual(self.client.post("/analyze", content=b"non json").status_code, 422)
+
+    def test_request_id_propagato_o_rigenerato(self):
+        valido = self.client.get("/health", headers={"X-Request-Id": "richiesta-di-prova-1"})
+        self.assertEqual(valido.headers["X-Request-Id"], "richiesta-di-prova-1")
+        sospetto = self.client.get("/health", headers={"X-Request-Id": "a b<script>"})
+        self.assertNotEqual(sospetto.headers["X-Request-Id"], "a b<script>")  # formato non valido: ID nuovo
+
+    def test_nomi_dei_grafici(self):
+        self.assertEqual(self.client.get("/charts/grafico_123.png").status_code, 400)     # nome fuori formato
+        self.assertEqual(self.client.get("/charts/app.py").status_code, 400)
+        self.assertNotEqual(self.client.get("/charts/..%2F..%2Fapp.py").status_code, 200)  # niente percorsi
+        self.assertEqual(self.client.get("/charts/grafico_0123456789.png").status_code, 404)  # formato ok, assente
 
 
 class TestGeneratore(unittest.TestCase):

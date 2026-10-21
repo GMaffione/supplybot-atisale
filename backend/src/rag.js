@@ -182,6 +182,7 @@ export async function indicizzaManuale({ forza = false } = {}) {
     await chroma.deleteCollection({ name: nome });
     collezione = await chroma.getOrCreateCollection({ name: nome, embeddingFunction: SENZA_FUNZIONE_EMBEDDING, configuration: CONFIG_INDICE });
   }
+  cacheRicerche.svuota(); // indice nuovo: i risultati delle ricerche precedenti non valgono piu'
   const vettori = await embedding(frammenti.map((f) => f.testo));
   await collezione.add({
     ids: frammenti.map((f) => f.id),
@@ -198,6 +199,8 @@ export async function indicizzaManuale({ forza = false } = {}) {
 // una domanda che non c'entra col manuale restituisce "nessun risultato pertinente" invece di
 // capitoli lontani che l'LLM potrebbe citare a sproposito. Nel RAG la qualita' del recupero conta
 // piu' del modello.
+// Cache delle ricerche: chiave = query normalizzata. Si svuota al riavvio (e' in memoria), dopo 6 ore,
+// oltre 300 voci (LRU) e ogni volta che l'indice del manuale viene ricostruito (vedi indicizzaManuale).
 const cacheRicerche = new CacheLRU({ massimo: 300 });
 
 /** Tiene solo i risultati con somiglianza >= soglia (funzione pura, testata in tests/backend.test.js). */

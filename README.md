@@ -254,13 +254,39 @@ All'avvio il data agent **valida lo schema** del CSV (`schema.py`), lo **diagnos
 - **Pandas agent come interprete deterministico**: l'LLM scrive il codice pandas, ma i numeri li calcola Python. È implementato con il function calling nativo invece che con `create_pandas_dataframe_agent` di LangChain: stesso schema (l'LLM scrive codice, un interprete lo esegue, l'LLM legge il risultato), ma con pieno controllo su sandbox, tempo massimo, autocorrezione e traccia dei passi.
 - **Dataset preparato una volta, all'avvio** (`dataset.py`): lettura del CSV, validazione dello schema, diagnosi, scelta delle pulizie in base alla diagnosi (ogni anomalia trovata attiva l'operazione che la corregge), pulizia e validazione rigida del risultato. Il dataframe pronto resta in memoria e su disco: ogni domanda parte da lì, senza rileggere il CSV e senza spendere passi LLM per ripulire dati che non cambiano. Ogni operazione è scritta in codice testato (`pulizia.py`); i valori impossibili vengono resi mancanti, mai inventati.
 - **Contratto dei dati** (`schema.py`): colonne obbligatorie, tipi, valori ammessi e formati. Sul CSV grezzo le anomalie correggibili sono avvisi; colonne mancanti o colonne in gran parte illeggibili sono errori. Se il CSV non è valido il data agent non analizza nulla e risponde 503 con l'elenco degli errori, invece di dare numeri sbagliati.
-- **Cache delle risposte**: le domande già viste non rifanno il lavoro. Tre livelli: risposta completa alla prima domanda di una conversazione (back end), ricerche nel manuale (back end), analisi del data agent (servizio Python, chiave = domanda + impronta del CSV). Cache in memoria con dimensione massima e scadenza (6 ore); le risposte con errori o con analisi non concluse non si salvano. Limite noto: se si cambia il CSV del data agent senza riavviare il back end, le risposte complete già in cache nel back end restano valide fino alla scadenza (online i due processi si riavviano insieme, quindi il problema non si pone).
+- **Cache delle risposte**: le domande già viste non rifanno il lavoro. Tre livelli, descritti nella sezione [Cache: cosa si memorizza e quando si svuota](#cache-cosa-si-memorizza-e-quando-si-svuota).
 - **Validazione degli ingressi con zod** al confine dell'API (`validazione.js`): `/api/chat` accetta solo `sessionId` e `message` nel formato atteso, nient'altro. Lo stesso schema fornisce i tipi al controllo statico.
 - **Controllo dei tipi con TypeScript sul JavaScript** (`npm run typecheck`, `tsconfig.json` con `checkJs`): TypeScript legge le annotazioni JSDoc e i tipi di zod senza compilare nulla. È il primo passo verso una migrazione completa a TypeScript.
 - **Log strutturati e ID di correlazione**: entrambi i servizi scrivono una riga JSON per evento (`logger.js`, `registro.py`). Il back end assegna un `request_id` a ogni domanda e lo passa al data agent nell'intestazione `X-Request-Id`: filtrando i log per quell'ID si ricostruisce tutto il percorso di una domanda. L'ID compare anche in fondo al pannello "Come ho risposto".
 - **Glossario aziendale nei prompt**: le definizioni del manuale (stagione invernale = novembre-febbraio, OTIF, volumi = tonnellate consegnate) sono scritte nei prompt, perché nelle prove con il modello reale l'LLM tendeva a usare definizioni proprie.
 - **Autocorrezione**: se il codice generato va in errore, il traceback torna all'LLM, che lo corregge e riprova.
 - **Guardia anti-allucinazione**: se il data agent prova a rispondere senza aver eseguito nessun calcolo, viene rimandato a calcolare.
+
+### Cache: cosa si memorizza e quando si svuota
+
+Tutte e tre le cache sono **in memoria**: vivono nel processo del servizio e **si svuotano completamente a ogni riavvio**. Non c'è un database o un file di cache. Online il riavvio avviene a ogni nuova pubblicazione (`git push`) e ogni volta che Render "addormenta" il servizio dopo 15 minuti senza visite: la prima domanda dopo il risveglio viene quindi ricalcolata.
+
+| Cache | Dove | Chiave | Cosa entra | Cosa non entra mai |
+| --- | --- | --- | --- | --- |
+| Risposte complete | back end, `orchestrator.js` | domanda normalizzata (minuscole, spazi uniformati, senza punteggiatura finale) | **solo la prima domanda** di una conversazione, se nessuno strumento ha dato errore e l'eventuale analisi è conclusa | le domande successive (dipendono dalla conversazione: «E per Sant'Antioco?» cambia significato), le risposte con errori, le analisi non concluse |
+| Ricerche nel manuale | back end, `rag.js` | query normalizzata | i frammenti trovati e i loro punteggi | — |
+| Analisi dei dati | data agent, `cache.py` | domanda normalizzata + impronta SHA-256 del CSV | le analisi concluse (almeno un calcolo eseguito) | le analisi non concluse (nessun calcolo, passi esauriti) |
+
+**Quando una voce smette di valere (invalidazione):**
+
+| Evento | Risposte complete | Ricerche nel manuale | Analisi dei dati |
+| --- | --- | --- | --- |
+| Riavvio del servizio (deploy, risveglio dopo 15 minuti, chiusura in locale) | svuotata | svuotata | svuotata |
+| Sono passate più di 6 ore dalla scrittura | ricalcolata | ricalcolata | ricalcolata |
+| Superato il numero massimo di voci (200 / 300 / 200) | si scarta la voce usata meno di recente (LRU) | idem | idem |
+| Indice del manuale ricostruito (manuale o chunking cambiati) | — | svuotata | — |
+| CSV diverso (impronta cambiata) | vedi limite qui sotto | — | le risposte vecchie non vengono più trovate |
+| Un grafico citato dalla risposta non esiste più sul disco | — | — | risposta scartata e ricalcolata |
+| Pulsante **Nuova conversazione** | la memoria della conversazione si azzera; la domanda successiva torna a essere una "prima domanda" e può usare la cache | — | — |
+
+Limite noto: in locale, se si cambia il CSV del data agent (`DATASET_CSV`) senza riavviare anche il back end, le risposte complete già memorizzate nel back end restano valide fino alla scadenza. Online i due processi stanno nello stesso container e si riavviano sempre insieme, quindi il caso non si presenta. Lo stato delle cache (voci, trovate, mancate, scadute) è visibile in `/api/health` e `/health`.
+
+Ogni regola è verificata da un test: `tests/cache.test.js` (back end, con finti LLM e data agent) e la classe `TestInvalidazioneCache` di `tests/test_data_agent.py`.
 
 ### Miglioramenti dopo la revisione dei docenti
 
@@ -275,6 +301,15 @@ All'avvio il data agent **valida lo schema** del CSV (`schema.py`), lo **diagnos
 | Chunking legato al formato del PDF (FAQ = capitolo 10) | FAQ riconosciute dal titolo, paragrafi lunghi divisi, ripiego a blocchi con sovrapposizione; l'indice si ricostruisce se i frammenti cambiano | `rag.js` |
 | `console.log` non strutturati, nessuna correlazione tra i servizi | Log JSON e `request_id` propagato dal back end al data agent | `logger.js`, `registro.py`, `dataAgent.js` |
 | Back end in JavaScript senza validazione dei tipi | zod su `/api/chat` e `/api/reset`; controllo dei tipi TypeScript (`checkJs`) | `validazione.js`, `tsconfig.json` |
+
+Seconda revisione:
+
+| Osservazione | Cosa è cambiato | Dove |
+| --- | --- | --- |
+| Documentare quando la cache viene invalidata (in memoria: si svuota al riavvio) | Sezione dedicata con le tabelle "cosa entra" e "quando si svuota"; stessa descrizione nei commenti del codice; stato delle cache in `/api/health` | README, `cache.js`, `cache.py`, `orchestrator.js` |
+| Chiarire che la cache dell'orchestratore riguarda solo le prime domande | Scritto nella tabella e verificato da test dedicati (seconda domanda mai in cache, "Nuova conversazione" la riattiva) | README, `tests/cache.test.js` |
+| Test mirati sui casi limite della validazione | Soglia del 5% esatta, file vuoto o mancante, colonne in più, formati di data e numeri, id di sessione 7/8/64/65 caratteri, messaggio al limite di lunghezza, corpi malformati, lunghezza della domanda al data agent | `tests/test_data_agent.py`, `tests/backend.test.js` |
+| Test mirati sull'invalidazione della cache | Scadenza (con orologio simulato), riavvio, svuotamento, LRU, CSV diverso, grafico cancellato, errori e analisi non concluse esclusi | `tests/test_data_agent.py`, `tests/cache.test.js` |
 
 ## Problemi incontrati e soluzioni
 
@@ -308,8 +343,14 @@ All'avvio il data agent **valida lo schema** del CSV (`schema.py`), lo **diagnos
 cd backend && npm test && npm run typecheck
 ```
 
-- `tests/test_data_agent.py`: validazione dello schema (CSV valido, colonna mancante, valori sconosciuti, date illeggibili, codici fuori formato), validazione rigida dopo la pulizia, scelta delle pulizie dalla diagnosi, CSV non riletto durante le domande, cache del data agent, riproducibilità del generatore con lo stesso seme;
-- `tests/backend.test.js`: chunking del manuale (29 frammenti, FAQ riconosciute dal titolo, ripiego a blocchi), soglia di somiglianza, schema zod, cache LRU con scadenza.
+- `tests/test_data_agent.py` (35 test):
+  - validazione dello schema e suoi **casi limite**: soglia del 5% esatta (75 valori sconosciuti su 1.501 = avviso, 76 = errore), file con sola intestazione, file mancante o non testuale, colonne in più, obbligatori vuoti sotto e sopra soglia, date `gg/mm/aaaa` e date impossibili (31 febbraio), numeri scritti come testo, maiuscole e spazi nelle categorie, codici spedizione al limite del formato;
+  - validazione rigida dopo la pulizia, scelta delle pulizie dalla diagnosi, CSV non riletto durante le domande;
+  - **invalidazione della cache** del data agent: scadenza dopo 6 ore (con orologio simulato), riavvio, svuotamento, LRU, CSV diverso, grafico cancellato, analisi non concluse escluse, domande simili e diverse;
+  - API del data agent: lunghezza della domanda (2, 3, 2000, 2001 caratteri), richieste malformate, `X-Request-Id` riusato o rigenerato, nomi dei grafici;
+  - riproducibilità del generatore con lo stesso seme.
+- `tests/backend.test.js` (11 test): chunking del manuale (29 frammenti, FAQ riconosciute dal titolo, ripiego a blocchi), soglia di somiglianza, schema zod e suoi **casi limite** (messaggio di esattamente 1.000 e 1.001 caratteri, spazi ai bordi, id di sessione di 7/8/64/65 caratteri e con caratteri non ammessi, corpi `null`, testo, array, campi in più), cache LRU con scadenza e svuotamento.
+- `tests/cache.test.js` (9 test): **invalidazione della cache delle risposte** dell'orchestratore, con finti LLM e data agent in locale: la prima domanda si riusa, la chiave ignora maiuscole e spazi, le domande successive non entrano, risposte con errori e analisi non concluse escluse, svuotamento, riavvio del modulo, "Nuova conversazione".
 
 **Test end-to-end** (`tests/test_e2e.py`, a servizi avviati): per quattro domande tipo controlla gli strumenti scelti dall'orchestratore, che diagnosi e pulizia precedano il calcolo, che i grafici siano scaricabili, che la memoria della sessione funzioni, che le domande ripetute arrivino dalla cache e che le richieste non valide vengano rifiutate. Usa solo la libreria standard di Python:
 
